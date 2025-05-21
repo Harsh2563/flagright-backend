@@ -3,7 +3,7 @@ import { PaymentMethodType } from '../types/enums/UserEnums';
 
 const PaymentMethodSchema = z.object({
   id: z.string().uuid(),
-  type: z.nativeEnum(PaymentMethodType)
+  type: z.nativeEnum(PaymentMethodType),
 });
 
 const AddressSchema = z.object({
@@ -11,13 +11,7 @@ const AddressSchema = z.object({
   city: z.string().optional(),
   state: z.string().optional(),
   postalCode: z.string().optional(),
-  country: z.string().optional()
-});
-
-const GoogleProfileSchema = z.object({
-  displayName: z.string().optional(),
-  email: z.string().email().optional(),
-  picture: z.string().url().optional()
+  country: z.string().optional(),
 });
 
 export const AddUserSchema = z.object({
@@ -25,13 +19,6 @@ export const AddUserSchema = z.object({
   lastName: z.string().min(2, 'Last name must be at least 2 characters'),
   email: z.string().email('Invalid email format'),
   phone: z.string().optional(),
-  password: z.string()
-    .min(8, 'Password must be at least 8 characters')
-    .optional(),
-  emailVerified: z.boolean().default(false),
-  googleId: z.string().optional(),
-  googleProfile: GoogleProfileSchema.optional(),
   address: AddressSchema.optional(),
-  paymentMethods: z.array(PaymentMethodSchema).optional()
+  paymentMethods: z.array(PaymentMethodSchema).optional(),
 });
-

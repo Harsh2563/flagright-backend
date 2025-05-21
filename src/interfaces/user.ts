@@ -6,14 +6,6 @@ export interface IUser {
   lastName: string;
   email: string;
   phone?: string;
-  password?: string;
-  emailVerified: boolean;
-  googleId?: string;
-  googleProfile?: {
-    displayName?: string;
-    email?: string;
-    picture?: string;
-  };
   address?: {
     street?: string;
     city?: string;
