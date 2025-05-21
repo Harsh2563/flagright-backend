@@ -1,6 +1,7 @@
 import express, { Application } from 'express';
 import Neo4jService from './services/neo4j.service';
 import userRouter from './routes/user';
+import transactionRouter from './routes/transaction';
 import 'dotenv/config';
 import morgan from 'morgan';
 
@@ -24,6 +25,7 @@ class App {
 
   private setupRoutes(): void {
     this.app.use('/api/users', userRouter);
+    this.app.use('/api/transactions', transactionRouter);
   }
 
   public listen(): void {
