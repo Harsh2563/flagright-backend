@@ -1,12 +1,29 @@
+// filepath: c:\Users\HARSH RAI\Desktop\Flagright\backend\src\models\User.ts
 import neo4j, { QueryResult } from 'neo4j-driver';
 import Neo4jDriver from '../services/neo4j.service';
 import { IUser } from '../interfaces/user';
 import { AppError } from '../utils/appError';
 
 class UserModel {
-  async create(
+  /**
+   * Upserts a user (creates new or updates existing based on email)
+   *
+   * This method will:
+   * 1. Check if a user with the provided email exists
+   * 2. If exists: Update the user with new data
+   * 3. If not exists: Create a new user
+   *
+   * For both cases, it will also handle related entities:
+   * - Address
+   * - Payment methods
+   * - Shared attribute relationships (email, phone, address, payment)
+   *
+   * @param userData User data excluding id, createdAt, updatedAt which are handled automatically
+   * @returns Object containing the user data and whether it was newly created
+   */
+  async upsert(
     userData: Omit<IUser, 'id' | 'createdAt' | 'updatedAt'>
-  ): Promise<IUser> {
+  ): Promise<{ user: IUser; isNew: boolean }> {
     const session = Neo4jDriver.getSession();
     const now = new Date().toISOString();
 
@@ -20,11 +37,18 @@ class UserModel {
           'MATCH (u:User {email: $email}) RETURN u',
           { email: userData.email }
         );
+
+        // User exists - perform update
         if (existingUserResult.records.length > 0) {
-          throw new AppError(
-            `User with email ${userData.email} already exists`,
-            409
+          const existingUser = this.extractUserFromRecord(existingUserResult);
+          const updatedUser = await this.updateExistingUser(
+            existingUser.id,
+            userData,
+            tx,
+            now
           );
+          await tx.commit();
+          return { user: updatedUser, isNew: false };
         }
 
         // Create user node
@@ -36,9 +60,6 @@ class UserModel {
             lastName: $lastName,
             email: $email,
             phone: $phone,
-            password: $password,
-            emailVerified: $emailVerified,
-            googleId: $googleId,
             createdAt: $createdAt,
             updatedAt: $createdAt
           })
@@ -49,36 +70,13 @@ class UserModel {
             lastName: userData.lastName,
             email: userData.email,
             phone: userData.phone || null,
-            password: userData.password || null,
-            emailVerified: userData.emailVerified,
-            googleId: userData.googleId || null,
             createdAt: now,
           }
         );
 
         const user = this.extractUserFromRecord(userResult);
 
-        // Create related nodes (GoogleProfile, Address, PaymentMethod)
-        if (userData.googleProfile) {
-          await tx.run(
-            `
-            MATCH (u:User {id: $userId})
-            CREATE (g:GoogleProfile {
-              displayName: $displayName,
-              email: $email,
-              picture: $picture
-            })
-            CREATE (u)-[:HAS_PROFILE]->(g)
-            `,
-            {
-              userId: user.id,
-              displayName: userData.googleProfile?.displayName || null,
-              email: userData.googleProfile?.email || null,
-              picture: userData.googleProfile?.picture || null,
-            }
-          );
-        }
-
+        // Create related nodes (Address, PaymentMethod)
         if (userData.address) {
           await tx.run(
             `
@@ -124,66 +122,10 @@ class UserModel {
         }
 
         // Create shared attribute relationships
-        // Shared Email
-        if (userData.email) {
-          await tx.run(
-            `
-            MATCH (u1:User {id: $userId})
-            MATCH (u2:User)
-            WHERE u2.email = $email AND u2.id <> $userId
-            CREATE (u1)-[:SHARED_EMAIL]->(u2)
-            `,
-            { userId: user.id, email: userData.email }
-          );
-        }
-
-        // Shared Phone
-        if (userData.phone) {
-          await tx.run(
-            `
-            MATCH (u1:User {id: $userId})
-            MATCH (u2:User)
-            WHERE u2.phone = $phone AND u2.id <> $userId
-            CREATE (u1)-[:SHARED_PHONE]->(u2)
-            `,
-            { userId: user.id, phone: userData.phone }
-          );
-        }
-
-        // Shared Address (match on key fields, e.g., street and city)
-        if (userData.address?.street && userData.address?.city) {
-          await tx.run(
-            `
-            MATCH (u1:User {id: $userId})-[:HAS_ADDRESS]->(a1:Address)
-            MATCH (u2:User)-[:HAS_ADDRESS]->(a2:Address)
-            WHERE a2.street = $street AND a2.city = $city AND u2.id <> $userId
-            CREATE (u1)-[:SHARED_ADDRESS]->(u2)
-            `,
-            {
-              userId: user.id,
-              street: userData.address.street,
-              city: userData.address.city,
-            }
-          );
-        }
-
-        // Shared Payment Method
-        if (userData.paymentMethods && userData.paymentMethods.length > 0) {
-          for (const paymentMethod of userData.paymentMethods) {
-            await tx.run(
-              `
-              MATCH (u1:User {id: $userId})-[:HAS_PAYMENT_METHOD]->(p1:PaymentMethod)
-              MATCH (u2:User)-[:HAS_PAYMENT_METHOD]->(p2:PaymentMethod)
-              WHERE p2.id = $paymentId AND u2.id <> $userId
-              CREATE (u1)-[:SHARED_PAYMENT_METHOD]->(u2)
-              `,
-              { userId: user.id, paymentId: paymentMethod.id }
-            );
-          }
-        }
+        await this.createSharedRelationships(user.id, userData, tx);
 
         await tx.commit();
-        return user;
+        return { user: user, isNew: true };
       } catch (error) {
         await tx.rollback();
         throw error;
@@ -193,6 +135,216 @@ class UserModel {
     }
   }
 
+  /**
+   * Updates an existing user with new data
+   *
+   * This private method handles the update logic for an existing user:
+   * 1. Updates basic user properties
+   * 2. Handles related entities (delete existing and recreate):
+   *    - Address
+   *    - Payment methods
+   * 3. Updates relationships with other users based on shared attributes
+   *
+   * @param userId ID of the existing user to update
+   * @param userData New user data to apply
+   * @param tx Active Neo4j transaction to use
+   * @param timestamp ISO timestamp string for the update operation
+   * @returns Updated user data
+   */
+  private async updateExistingUser(
+    userId: string,
+    userData: Omit<IUser, 'id' | 'createdAt' | 'updatedAt'>,
+    tx: any,
+    timestamp: string
+  ): Promise<IUser> {
+    // Update user properties
+    const updateResult = await tx.run(
+      `
+      MATCH (u:User {id: $userId})
+      SET u.firstName = $firstName,
+          u.lastName = $lastName,
+          u.phone = $phone,
+          u.updatedAt = $updatedAt
+      RETURN u
+      `,
+      {
+        userId,
+        firstName: userData.firstName,
+        lastName: userData.lastName,
+        phone: userData.phone || null,
+        updatedAt: timestamp,
+      }
+    );
+
+    const updatedUser = this.extractUserFromRecord(updateResult);
+
+    // Update or create Address
+    if (userData.address) {
+      // Delete existing Address if present
+      await tx.run(
+        `
+        MATCH (u:User {id: $userId})-[r:HAS_ADDRESS]->(a:Address)
+        DELETE r, a
+        `,
+        { userId }
+      );
+
+      // Create new Address
+      await tx.run(
+        `
+        MATCH (u:User {id: $userId})
+        CREATE (a:Address {
+          street: $street,
+          city: $city,
+          state: $state,
+          postalCode: $postalCode,
+          country: $country
+        })
+        CREATE (u)-[:HAS_ADDRESS]->(a)
+        `,
+        {
+          userId,
+          street: userData.address?.street || null,
+          city: userData.address?.city || null,
+          state: userData.address?.state || null,
+          postalCode: userData.address?.postalCode || null,
+          country: userData.address?.country || null,
+        }
+      );
+    }
+
+    // Update Payment Methods
+    if (userData.paymentMethods && userData.paymentMethods.length > 0) {
+      // Delete existing Payment Methods if present
+      await tx.run(
+        `
+        MATCH (u:User {id: $userId})-[r:HAS_PAYMENT_METHOD]->(p:PaymentMethod)
+        DELETE r, p
+        `,
+        { userId }
+      );
+
+      // Create new Payment Methods
+      for (const paymentMethod of userData.paymentMethods) {
+        await tx.run(
+          `
+          MATCH (u:User {id: $userId})
+          CREATE (p:PaymentMethod {
+            id: $paymentId,
+            type: $paymentType
+          })
+          CREATE (u)-[:HAS_PAYMENT_METHOD]->(p)
+          `,
+          {
+            userId,
+            paymentId: paymentMethod.id,
+            paymentType: paymentMethod.type,
+          }
+        );
+      }
+    }
+
+    // Update shared relationships
+    // For each type of relationship, we delete existing ones and recreate based on the updated data
+
+    // Delete existing shared relationships
+    await tx.run(
+      `
+      MATCH (u:User {id: $userId})-[r:SHARED_EMAIL|SHARED_PHONE|SHARED_ADDRESS|SHARED_PAYMENT_METHOD]->()
+      DELETE r
+      `,
+      { userId }
+    );
+
+    // Recreate shared relationships
+    await this.createSharedRelationships(userId, userData, tx);
+
+    return updatedUser;
+  }
+
+  /**
+   * Creates shared attribute relationships between users
+   *
+   * This helper method establishes relationships between users who share:
+   * - Email addresses
+   * - Phone numbers
+   * - Physical addresses
+   * - Payment methods
+   *
+   * @param userId ID of the user to create relationships for
+   * @param userData User data containing attributes to check for sharing
+   * @param tx Active Neo4j transaction
+   */
+  private async createSharedRelationships(
+    userId: string,
+    userData: Omit<IUser, 'id' | 'createdAt' | 'updatedAt'>,
+    tx: any
+  ): Promise<void> {
+    // Shared Email
+    if (userData.email) {
+      await tx.run(
+        `
+        MATCH (u1:User {id: $userId})
+        MATCH (u2:User)
+        WHERE u2.email = $email AND u2.id <> $userId
+        CREATE (u1)-[:SHARED_EMAIL]->(u2)
+        `,
+        { userId, email: userData.email }
+      );
+    }
+
+    // Shared Phone
+    if (userData.phone) {
+      await tx.run(
+        `
+        MATCH (u1:User {id: $userId})
+        MATCH (u2:User)
+        WHERE u2.phone = $phone AND u2.id <> $userId
+        CREATE (u1)-[:SHARED_PHONE]->(u2)
+        `,
+        { userId, phone: userData.phone }
+      );
+    }
+
+    // Shared Address (match on key fields, e.g., street and city)
+    if (userData.address?.street && userData.address?.city) {
+      await tx.run(
+        `
+        MATCH (u1:User {id: $userId})-[:HAS_ADDRESS]->(a1:Address)
+        MATCH (u2:User)-[:HAS_ADDRESS]->(a2:Address)
+        WHERE a2.street = $street AND a2.city = $city AND u2.id <> $userId
+        CREATE (u1)-[:SHARED_ADDRESS]->(u2)
+        `,
+        {
+          userId,
+          street: userData.address.street,
+          city: userData.address.city,
+        }
+      );
+    }
+
+    // Shared Payment Method
+    if (userData.paymentMethods && userData.paymentMethods.length > 0) {
+      for (const paymentMethod of userData.paymentMethods) {
+        await tx.run(
+          `
+          MATCH (u1:User {id: $userId})-[:HAS_PAYMENT_METHOD]->(p1:PaymentMethod)
+          MATCH (u2:User)-[:HAS_PAYMENT_METHOD]->(p2:PaymentMethod)
+          WHERE p2.id = $paymentId AND u2.id <> $userId
+          CREATE (u1)-[:SHARED_PAYMENT_METHOD]->(u2)
+          `,
+          { userId, paymentId: paymentMethod.id }
+        );
+      }
+    }
+  }
+
+  /**
+   * Extracts user data from a Neo4j record
+   *
+   * @param result The Neo4j query result containing user records
+   * @returns User data object conforming to the IUser interface
+   */
   private extractUserFromRecord(result: QueryResult): IUser {
     const record = result.records[0];
     const userProps = record.get('u').properties;
@@ -203,12 +355,34 @@ class UserModel {
       lastName: userProps.lastName,
       email: userProps.email,
       phone: userProps.phone || undefined,
-      password: userProps.password || undefined,
-      emailVerified: userProps.emailVerified,
-      googleId: userProps.googleId || undefined,
       createdAt: userProps.createdAt,
       updatedAt: userProps.updatedAt,
     };
+  }
+
+  /**
+   * Finds a user by email address
+   *
+   * @param email Email address to search for
+   * @returns User object if found, null otherwise
+   */
+  async findByEmail(email: string): Promise<IUser | null> {
+    const session = Neo4jDriver.getSession();
+
+    try {
+      const result = await session.run(
+        'MATCH (u:User {email: $email}) RETURN u',
+        { email }
+      );
+
+      if (result.records.length === 0) {
+        return null;
+      }
+
+      return this.extractUserFromRecord(result);
+    } finally {
+      session.close();
+    }
   }
 }
 

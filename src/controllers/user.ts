@@ -10,10 +10,15 @@ export default class UserController {
   ) {
     try {
       const userData = req.body;
-      const user = await UserModel.create(userData);
 
-      return res.status(201).json({
+      const result = await UserModel.upsert(userData);
+      const { user, isNew } = result;
+
+      return res.status(isNew ? 201 : 200).json({
         status: 'success',
+        message: isNew
+          ? 'User created successfully'
+          : 'User updated successfully',
         data: { user },
       });
     } catch (error) {
@@ -23,6 +28,7 @@ export default class UserController {
           message: error.message,
         });
       }
+      console.error('Error in createUser:', error);
       next(error);
     }
   }
