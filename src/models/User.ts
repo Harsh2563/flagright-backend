@@ -1,43 +1,34 @@
-import neo4j from 'neo4j-driver';
+import neo4j, { QueryResult } from 'neo4j-driver';
 import Neo4jDriver from '../services/neo4j.service';
 import { IUser } from '../interfaces/user';
 import { AppError } from '../utils/appError';
 
-class UserModel {  async create(
+class UserModel {
+  async create(
     userData: Omit<IUser, 'id' | 'createdAt' | 'updatedAt'>
   ): Promise<IUser> {
     const session = Neo4jDriver.getSession();
     const now = new Date().toISOString();
 
     try {
-      // Validate required fields
-      if (!userData.firstName) {
-        throw new AppError('First name is required', 400);
-      }
-      if (!userData.lastName) {
-        throw new AppError('Last name is required', 400);
-      }
-      if (!userData.email) {
-        throw new AppError('Email is required', 400);
-      }
-      
-      // Check if a user with the same email already exists
-      const existingUserResult = await session.executeRead((tx: any) =>
-        tx.run('MATCH (u:User {email: $email}) RETURN u', {
-          email: userData.email,
-        })
-      );
+      // Start a transaction
+      const tx = session.beginTransaction();
 
-      if (existingUserResult.records.length > 0) {
-        throw new AppError(
-          `User with email ${userData.email} already exists`,
-          409
+      try {
+        // Check for existing user with same email
+        const existingUserResult = await tx.run(
+          'MATCH (u:User {email: $email}) RETURN u',
+          { email: userData.email }
         );
-      }
+        if (existingUserResult.records.length > 0) {
+          throw new AppError(
+            `User with email ${userData.email} already exists`,
+            409
+          );
+        }
 
-      // Create the basic user node
-      const userResult = await session.executeWrite((tx: any) =>
-        tx.run(
+        // Create user node
+        const userResult = await tx.run(
           `
           CREATE (u:User {
             id: randomUUID(),
@@ -63,15 +54,13 @@ class UserModel {  async create(
             googleId: userData.googleId || null,
             createdAt: now,
           }
-        )
-      );
+        );
 
-      const user = this.extractUserFromRecord(userResult);
+        const user = this.extractUserFromRecord(userResult);
 
-      // Add Google profile if provided
-      if (userData.googleProfile) {
-        await session.executeWrite((tx: any) =>
-          tx.run(
+        // Create related nodes (GoogleProfile, Address, PaymentMethod)
+        if (userData.googleProfile) {
+          await tx.run(
             `
             MATCH (u:User {id: $userId})
             CREATE (g:GoogleProfile {
@@ -87,14 +76,11 @@ class UserModel {  async create(
               email: userData.googleProfile?.email || null,
               picture: userData.googleProfile?.picture || null,
             }
-          )
-        );
-      }
+          );
+        }
 
-      // Add address if provided
-      if (userData.address) {
-        await session.executeWrite((tx: any) =>
-          tx.run(
+        if (userData.address) {
+          await tx.run(
             `
             MATCH (u:User {id: $userId})
             CREATE (a:Address {
@@ -114,15 +100,12 @@ class UserModel {  async create(
               postalCode: userData.address?.postalCode || null,
               country: userData.address?.country || null,
             }
-          )
-        );
-      }
+          );
+        }
 
-      // Add payment methods if provided
-      if (userData.paymentMethods && userData.paymentMethods.length > 0) {
-        for (const paymentMethod of userData.paymentMethods) {
-          await session.executeWrite((tx: any) =>
-            tx.run(
+        if (userData.paymentMethods && userData.paymentMethods.length > 0) {
+          for (const paymentMethod of userData.paymentMethods) {
+            await tx.run(
               `
               MATCH (u:User {id: $userId})
               CREATE (p:PaymentMethod {
@@ -136,20 +119,81 @@ class UserModel {  async create(
                 paymentId: paymentMethod.id,
                 paymentType: paymentMethod.type,
               }
-            )
+            );
+          }
+        }
+
+        // Create shared attribute relationships
+        // Shared Email
+        if (userData.email) {
+          await tx.run(
+            `
+            MATCH (u1:User {id: $userId})
+            MATCH (u2:User)
+            WHERE u2.email = $email AND u2.id <> $userId
+            CREATE (u1)-[:SHARED_EMAIL]->(u2)
+            `,
+            { userId: user.id, email: userData.email }
           );
         }
-      }
 
-      return user;
+        // Shared Phone
+        if (userData.phone) {
+          await tx.run(
+            `
+            MATCH (u1:User {id: $userId})
+            MATCH (u2:User)
+            WHERE u2.phone = $phone AND u2.id <> $userId
+            CREATE (u1)-[:SHARED_PHONE]->(u2)
+            `,
+            { userId: user.id, phone: userData.phone }
+          );
+        }
+
+        // Shared Address (match on key fields, e.g., street and city)
+        if (userData.address?.street && userData.address?.city) {
+          await tx.run(
+            `
+            MATCH (u1:User {id: $userId})-[:HAS_ADDRESS]->(a1:Address)
+            MATCH (u2:User)-[:HAS_ADDRESS]->(a2:Address)
+            WHERE a2.street = $street AND a2.city = $city AND u2.id <> $userId
+            CREATE (u1)-[:SHARED_ADDRESS]->(u2)
+            `,
+            {
+              userId: user.id,
+              street: userData.address.street,
+              city: userData.address.city,
+            }
+          );
+        }
+
+        // Shared Payment Method
+        if (userData.paymentMethods && userData.paymentMethods.length > 0) {
+          for (const paymentMethod of userData.paymentMethods) {
+            await tx.run(
+              `
+              MATCH (u1:User {id: $userId})-[:HAS_PAYMENT_METHOD]->(p1:PaymentMethod)
+              MATCH (u2:User)-[:HAS_PAYMENT_METHOD]->(p2:PaymentMethod)
+              WHERE p2.id = $paymentId AND u2.id <> $userId
+              CREATE (u1)-[:SHARED_PAYMENT_METHOD]->(u2)
+              `,
+              { userId: user.id, paymentId: paymentMethod.id }
+            );
+          }
+        }
+
+        await tx.commit();
+        return user;
+      } catch (error) {
+        await tx.rollback();
+        throw error;
+      }
     } finally {
       await session.close();
     }
   }
-  /**
-   * Helper method to extract a basic user from a Neo4j record
-   */
-  private extractUserFromRecord(result: any): IUser {
+
+  private extractUserFromRecord(result: QueryResult): IUser {
     const record = result.records[0];
     const userProps = record.get('u').properties;
 
@@ -165,27 +209,6 @@ class UserModel {  async create(
       createdAt: userProps.createdAt,
       updatedAt: userProps.updatedAt,
     };
-  }
-
-  /**
-   * Find a user by their ID
-   */
-  async findById(id: string): Promise<IUser> {
-    const session = Neo4jDriver.getSession();
-
-    try {
-      const result = await session.executeRead((tx: any) =>
-        tx.run('MATCH (u:User {id: $id}) RETURN u', { id })
-      );
-
-      if (result.records.length === 0) {
-        throw new AppError(`User with ID ${id} not found`, 404);
-      }
-
-      return this.extractUserFromRecord(result);
-    } finally {
-      await session.close();
-    }
   }
 }
 
