@@ -3,7 +3,7 @@ import UserModel from '../models/User';
 import { AppError } from '../utils/appError';
 
 export default class UserController {
-  public static async createUser(
+  public static async handleUser(
     req: Request,
     res: Response,
     next: NextFunction
@@ -27,8 +27,7 @@ export default class UserController {
           status: 'error',
           message: error.message,
         });
-      }
-      console.error('Error in createUser:', error);
+      }      console.error('Error in handleUser:', error);
       next(error);
     }
   }

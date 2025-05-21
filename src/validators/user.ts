@@ -14,7 +14,8 @@ const AddressSchema = z.object({
   country: z.string().optional(),
 });
 
-export const AddUserSchema = z.object({
+export const UserSchema = z.object({
+  id: z.string().uuid('Invalid user ID format').optional(),
   firstName: z.string().min(2, 'First name must be at least 2 characters'),
   lastName: z.string().min(2, 'Last name must be at least 2 characters'),
   email: z.string().email('Invalid email format'),

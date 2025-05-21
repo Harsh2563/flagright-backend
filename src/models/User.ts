@@ -6,23 +6,23 @@ import { AppError } from '../utils/appError';
 
 class UserModel {
   /**
-   * Upserts a user (creates new or updates existing based on email)
+  /**
+   * Upserts a user (updates if ID is provided, otherwise creates new)
    *
    * This method will:
-   * 1. Check if a user with the provided email exists
-   * 2. If exists: Update the user with new data
-   * 3. If not exists: Create a new user
+   * 1. If ID is provided: Update the existing user with that ID
+   * 2. Otherwise: Create a new user with required fields
    *
    * For both cases, it will also handle related entities:
    * - Address
    * - Payment methods
    * - Shared attribute relationships (email, phone, address, payment)
    *
-   * @param userData User data excluding id, createdAt, updatedAt which are handled automatically
+   * @param userData User data (may include id for updates)
    * @returns Object containing the user data and whether it was newly created
    */
   async upsert(
-    userData: Omit<IUser, 'id' | 'createdAt' | 'updatedAt'>
+    userData: Partial<IUser>
   ): Promise<{ user: IUser; isNew: boolean }> {
     const session = Neo4jDriver.getSession();
     const now = new Date().toISOString();
@@ -32,23 +32,29 @@ class UserModel {
       const tx = session.beginTransaction();
 
       try {
-        // Check for existing user with same email
-        const existingUserResult = await tx.run(
-          'MATCH (u:User {email: $email}) RETURN u',
-          { email: userData.email }
-        );
-
-        // User exists - perform update
-        if (existingUserResult.records.length > 0) {
-          const existingUser = this.extractUserFromRecord(existingUserResult);
-          const updatedUser = await this.updateExistingUser(
-            existingUser.id,
-            userData,
-            tx,
-            now
+        // Handle updates by ID only
+        if (userData.id) {
+          const existingResult = await tx.run(
+            `
+            MATCH (u:User {id: $id})
+            RETURN u
+            `,
+            { id: userData.id }
           );
-          await tx.commit();
-          return { user: updatedUser, isNew: false };
+
+          if (existingResult.records.length > 0) {
+            // User with provided ID exists - update it
+            const updatedUser = await this.updateExistingUser(
+              userData.id,
+              userData,
+              tx,
+              now
+            );
+            await tx.commit();
+            return { user: updatedUser, isNew: false };
+          } else {
+            throw new AppError(`User with ID ${userData.id} not found`, 404);
+          }
         }
 
         // Create user node
@@ -122,6 +128,7 @@ class UserModel {
         }
 
         // Create shared attribute relationships
+        // We know all required fields exist at this point for a new user
         await this.createSharedRelationships(user.id, userData, tx);
 
         await tx.commit();
@@ -156,7 +163,7 @@ class UserModel {
    */
   private async updateExistingUser(
     userId: string,
-    userData: Omit<IUser, 'id' | 'createdAt' | 'updatedAt'>,
+    userData: Partial<IUser>,
     tx: any,
     timestamp: string
   ): Promise<IUser> {
@@ -167,7 +174,8 @@ class UserModel {
       SET u.firstName = $firstName,
           u.lastName = $lastName,
           u.phone = $phone,
-          u.updatedAt = $updatedAt
+          u.updatedAt = $updatedAt,
+          u.email = $email
       RETURN u
       `,
       {
@@ -176,6 +184,7 @@ class UserModel {
         lastName: userData.lastName,
         phone: userData.phone || null,
         updatedAt: timestamp,
+        email: userData.email,
       }
     );
 
@@ -264,7 +273,6 @@ class UserModel {
 
     return updatedUser;
   }
-
   /**
    * Creates shared attribute relationships between users
    *
@@ -280,7 +288,7 @@ class UserModel {
    */
   private async createSharedRelationships(
     userId: string,
-    userData: Omit<IUser, 'id' | 'createdAt' | 'updatedAt'>,
+    userData: Partial<IUser>,
     tx: any
   ): Promise<void> {
     // Shared Email
