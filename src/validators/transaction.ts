@@ -11,11 +11,6 @@ const DeviceInfoSchema = z.object({
   geolocation: GeolocationSchema.optional()
 });
 
-const PaymentTypeSchema = z.object({
-  id: z.string().uuid(),
-  type: z.string()
-});
-
 export const AddTransactionSchema = z.object({
   transactionType: z.nativeEnum(TransactionType, {
     errorMap: () => ({ message: 'Invalid transaction type' })
@@ -34,6 +29,5 @@ export const AddTransactionSchema = z.object({
   deviceId: z.string().optional(),
   deviceInfo: DeviceInfoSchema.optional(),
   paymentMethod: z.nativeEnum(PaymentMethodType).optional(),
-  paymentType: PaymentTypeSchema.optional()
 });
 

@@ -1,4 +1,8 @@
-import { PaymentMethodType, TransactionStatus, TransactionType } from "../types/enums/TransactionEnums";
+import {
+  PaymentMethodType,
+  TransactionStatus,
+  TransactionType,
+} from '../types/enums/TransactionEnums';
 
 export interface ITransaction {
   id: string;
@@ -21,8 +25,4 @@ export interface ITransaction {
     };
   };
   paymentMethod?: PaymentMethodType;
-  paymentType?: {
-    id: string;
-    type: string;
-  };
 }
