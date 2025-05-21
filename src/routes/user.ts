@@ -5,6 +5,11 @@ import UserController from '../controllers/user';
 
 const router = Router();
 
-router.post('/', validateRequest(AddUserSchema), UserController.createUser as RequestHandler);
+router.post(
+  '/',
+  validateRequest(AddUserSchema),
+  UserController.createUser as RequestHandler
+);
+router.get('/', UserController.getAllUsers as RequestHandler);
 
 export default router;

@@ -32,4 +32,29 @@ export default class UserController {
       next(error);
     }
   }
+
+  public static async getAllUsers(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) {
+    try {
+      const users = await UserModel.getAllUsers();
+
+      return res.status(200).json({
+        status: 'success',
+        results: users.length,
+        data: { users },
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        return res.status(error.statusCode).json({
+          status: 'error',
+          message: error.message,
+        });
+      }
+      console.error('Error in getAllUsers:', error);
+      next(error);
+    }
+  }
 }

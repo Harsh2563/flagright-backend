@@ -128,7 +128,10 @@ class UserModel {
         return { user: user, isNew: true };
       } catch (error) {
         await tx.rollback();
-        throw error;
+        throw new AppError(
+          'Error while upserting user: ' +
+            (error instanceof Error ? error.message : String(error))
+        );
       }
     } finally {
       await session.close();
@@ -358,6 +361,92 @@ class UserModel {
       createdAt: userProps.createdAt,
       updatedAt: userProps.updatedAt,
     };
+  }
+  /**
+   * Retrieves all users from the database with their associated address and payment details
+   *
+   * @returns Array of user objects with complete address and payment information
+   */
+  async getAllUsers(): Promise<IUser[]> {
+    const session = Neo4jDriver.getSession();
+
+    try {
+      // Query users with optional address and payment method relationships
+      const result = await session.run(`
+        MATCH (u:User)
+        OPTIONAL MATCH (u)-[:HAS_ADDRESS]->(a:Address)
+        OPTIONAL MATCH (u)-[:HAS_PAYMENT_METHOD]->(p:PaymentMethod)
+        RETURN u, 
+               collect(DISTINCT a) AS addresses, 
+               collect(DISTINCT p) AS paymentMethods
+        ORDER BY u.createdAt DESC
+      `);
+
+      if (result.records.length === 0) {
+        return [];
+      }
+
+      return result.records.map((record) => {
+        const userProps = record.get('u').properties;
+        const addresses = record.get('addresses');
+        const paymentMethods = record.get('paymentMethods');
+
+        // Extract address if available (first non-null address in collection)
+        let address = undefined;
+        if (addresses && addresses.length > 0 && addresses[0] !== null) {
+          const addressNode = addresses[0];
+          address = {
+            street: addressNode.properties.street || undefined,
+            city: addressNode.properties.city || undefined,
+            state: addressNode.properties.state || undefined,
+            postalCode: addressNode.properties.postalCode || undefined,
+            country: addressNode.properties.country || undefined,
+          };
+        }
+
+        // Extract payment methods if available
+        let userPaymentMethods = undefined;
+        if (
+          paymentMethods &&
+          paymentMethods.length > 0 &&
+          paymentMethods[0] !== null
+        ) {
+          userPaymentMethods = paymentMethods
+            .map((payment: any) => {
+              if (payment === null) return null;
+              return {
+                id: payment.properties.id,
+                type: payment.properties.type,
+              };
+            })
+            .filter((p: any) => p !== null);
+
+          // If no valid payment methods, set to undefined
+          if (userPaymentMethods.length === 0) {
+            userPaymentMethods = undefined;
+          }
+        }
+
+        return {
+          id: userProps.id,
+          firstName: userProps.firstName,
+          lastName: userProps.lastName,
+          email: userProps.email,
+          phone: userProps.phone || undefined,
+          address: address,
+          paymentMethods: userPaymentMethods,
+          createdAt: userProps.createdAt,
+          updatedAt: userProps.updatedAt,
+        };
+      });
+    } catch (error) {
+      throw new AppError(
+        'Error while retrieving users: ' +
+          (error instanceof Error ? error.message : String(error))
+      );
+    } finally {
+      session.close();
+    }
   }
 
   /**
