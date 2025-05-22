@@ -2,6 +2,7 @@ import neo4j from 'neo4j-driver';
 import Neo4jService from '../services/neo4j.service';
 import { ITransaction } from '../interfaces/transaction';
 import { AppError } from '../utils/appError';
+import { ITransactionConnections } from '../interfaces/relationship';
 
 class TransactionModel {
   /**
@@ -432,6 +433,99 @@ class TransactionModel {
       throw new AppError(
         'Error while retrieving transactions: ' +
           (error instanceof Error ? error.message : String(error))
+      );
+    } finally {
+      session.close();
+    }
+  }
+
+  /**
+   * Retrieves all connections for a given transaction.
+   * Connections include:
+   * - Sender and receiver users
+   * - Other transactions that share the same device ID
+   * - Other transactions that share the same IP address
+   *
+   * @param transactionId The ID of the transaction whose connections are to be fetched.
+   * @returns An object containing sender, receiver, and related transactions.
+   * @throws {AppError} If there is an error during database interaction or transaction not found.
+   */
+  async getTransactionConnections(
+    transactionId: string
+  ): Promise<ITransactionConnections> {
+    const session = Neo4jService.getSession();
+    try {
+      // Fetch sender and receiver information
+      const usersResult = await session.run(
+        `
+        MATCH (sender:User)-[:SENT]->(t:Transaction {id: $transactionId})-[:RECEIVED_BY]->(receiver:User)
+        RETURN sender { .id, .firstName, .lastName, .email } AS senderData,
+               receiver { .id, .firstName, .lastName, .email } AS receiverData
+        `,
+        { transactionId }
+      );
+
+      if (usersResult.records.length === 0) {
+        throw new AppError(
+          `Unable to find users for transaction ${transactionId}`,
+          404
+        );
+      }
+
+      const senderData = usersResult.records[0].get('senderData');
+      const receiverData = usersResult.records[0].get('receiverData');
+
+      // Fetch transactions sharing the same device ID
+      const sharedDeviceResult = await session.run(
+        `
+        MATCH (t1:Transaction {id: $transactionId})
+        WHERE t1.deviceId IS NOT NULL
+        MATCH (t2:Transaction)-[r:SHARED_DEVICE]-(t1)
+        RETURN type(r) as relationshipType, 
+               t2 { .id, .transactionType, .status, .amount, .currency, .timestamp, .deviceId } as relatedTransaction
+        `,
+        { transactionId }
+      );
+
+      const sharedDeviceTransactions = sharedDeviceResult.records.map(
+        (record) => ({
+          relationshipType: record.get('relationshipType'),
+          transaction: record.get('relatedTransaction'),
+        })
+      );
+
+      // Fetch transactions sharing the same IP address
+      const sharedIPResult = await session.run(
+        `
+        MATCH (t1:Transaction {id: $transactionId})-[:FROM_DEVICE]->(d1:DeviceInfo)
+        MATCH (t2:Transaction)-[r:SHARED_IP]-(t1)
+        RETURN type(r) as relationshipType, 
+               t2 { .id, .transactionType, .status, .amount, .currency, .timestamp, .deviceId } as relatedTransaction
+        `,
+        { transactionId }
+      );
+
+      const sharedIPTransactions = sharedIPResult.records.map((record) => ({
+        relationshipType: record.get('relationshipType'),
+        transaction: record.get('relatedTransaction'),
+      }));
+
+      // Return combined results
+      return {
+        sender: senderData,
+        receiver: receiverData,
+        sharedDeviceTransactions,
+        sharedIPTransactions,
+      };
+    } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
+      console.error('Error in getTransactionConnections:', error);
+      throw new AppError(
+        'Error while fetching transaction connections: ' +
+          (error instanceof Error ? error.message : String(error)),
+        500
       );
     } finally {
       session.close();

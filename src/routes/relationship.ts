@@ -8,4 +8,9 @@ router.get(
   RelationshipController.getUserRelationships as RequestHandler
 );
 
+router.get(
+  '/transaction/:transactionId',
+  RelationshipController.getTransactionRelationships as RequestHandler
+);
+
 export default router;
