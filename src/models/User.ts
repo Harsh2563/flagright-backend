@@ -1,8 +1,18 @@
-// filepath: c:\Users\HARSH RAI\Desktop\Flagright\backend\src\models\User.ts
-import neo4j, { QueryResult } from 'neo4j-driver';
+import neo4j, {
+  QueryResult,
+  Record as Neo4jRecord,
+  Node as Neo4jNode,
+} from 'neo4j-driver';
 import Neo4jDriver from '../services/neo4j.service';
 import { IUser } from '../interfaces/user';
+import { ITransaction } from '../interfaces/transaction'; 
+import {
+  TransactionStatus,
+  PaymentMethodType,
+  TransactionType,
+} from '../types/enums/TransactionEnums';
 import { AppError } from '../utils/appError';
+import { IConnectedTransactionInfo, IDirectRelationship, IUserConnections } from '../interfaces/relationship';
 
 class UserModel {
   /**
@@ -480,6 +490,187 @@ class UserModel {
     } finally {
       session.close();
     }
+  }
+
+  /**
+   * Retrieves all connections for a given user.
+   * Connections include:
+   * - Direct relationships (SHARED_EMAIL, SHARED_PHONE, etc.) with other users.
+   * - Transactions sent by the user, along with the receiver.
+   * - Transactions received by the user, along with the sender.
+   *
+   * @param userId The ID of the user whose connections are to be fetched.
+   * @returns An object containing lists of direct relationships, sent transactions, and received transactions.
+   * @throws {AppError} If there is an error during database interaction.
+   */
+  async getUserConnections(userId: string): Promise<IUserConnections> {
+    const session = Neo4jDriver.getSession();
+    try {
+      // Fetch direct relationships
+      const directRelationshipsResult = await session.run(
+        `
+        MATCH (currentUser:User {id: $userId})-[r:SHARED_EMAIL|SHARED_PHONE|SHARED_ADDRESS|SHARED_PAYMENT_METHOD]-(relatedUser:User)
+        RETURN type(r) as relationshipType, relatedUser { .id, .firstName, .lastName, .email } AS relatedUserData
+        `,
+        { userId }
+      );
+
+      const directRelationships: IDirectRelationship[] =
+        directRelationshipsResult.records.map((record: Neo4jRecord) => ({
+          relationshipType: record.get('relationshipType') as string,
+          user: record.get('relatedUserData') as Partial<IUser>,
+        }));
+
+      // Fetch transactions (sent and received)
+      const transactionsResult = await session.run(
+        `
+        // Sent transactions
+        MATCH (currentUser:User {id: $userId})-[:SENT]->(tx:Transaction)-[:RECEIVED_BY]->(receiver:User)
+        OPTIONAL MATCH (tx)-[:FROM_DEVICE]->(d:DeviceInfo)
+        OPTIONAL MATCH (d)-[:LOCATED_AT]->(g:Geolocation)
+        OPTIONAL MATCH (tx)-[:USED_PAYMENT]->(pt:PaymentType)
+        RETURN tx, receiver { .id, .firstName, .lastName, .email } AS relatedUserData, d, g, pt, 'SENT' AS direction
+        UNION ALL
+        // Received transactions
+        MATCH (sender:User)-[:SENT]->(tx:Transaction)-[:RECEIVED_BY]->(currentUser:User {id: $userId})
+        OPTIONAL MATCH (tx)-[:FROM_DEVICE]->(d:DeviceInfo)
+        OPTIONAL MATCH (d)-[:LOCATED_AT]->(g:Geolocation)
+        OPTIONAL MATCH (tx)-[:USED_PAYMENT]->(pt:PaymentType)
+        RETURN tx, sender { .id, .firstName, .lastName, .email } AS relatedUserData, d, g, pt, 'RECEIVED' AS direction
+        `,
+        { userId }
+      );
+
+      const sentTransactions: IConnectedTransactionInfo[] = [];
+      const receivedTransactions: IConnectedTransactionInfo[] = [];
+
+      transactionsResult.records.forEach((record: Neo4jRecord) => {
+        const txNode = record.get('tx') as Neo4jNode;
+        const relatedUserData = record.get('relatedUserData') as Partial<IUser>;
+        const deviceInfoNode = record.get('d') as Neo4jNode | null;
+        const geolocationNode = record.get('g') as Neo4jNode | null;
+        const paymentTypeNode = record.get('pt') as Neo4jNode | null;
+        const direction = record.get('direction') as 'SENT' | 'RECEIVED';
+
+        const transactionInfo: IConnectedTransactionInfo = {
+          transaction: this.parseTransactionProperties(
+            txNode,
+            deviceInfoNode,
+            geolocationNode,
+            paymentTypeNode
+          ),
+          relatedUser: relatedUserData,
+        };
+
+        if (direction === 'SENT') {
+          sentTransactions.push(transactionInfo);
+        } else {
+          receivedTransactions.push(transactionInfo);
+        }
+      });
+
+      // Fetch shared transaction relationships (SHARED_IP, SHARED_DEVICE)
+      const sharedTransactionRelationshipsResult = await session.run(
+        `
+        MATCH (currentUser:User {id: $userId})-[:SENT|:RECEIVED_BY]->(tx1:Transaction)-[r:SHARED_IP|SHARED_DEVICE]->(tx2:Transaction)
+        MATCH (tx2)-[:SENT|:RECEIVED_BY]->(relatedUser:User)
+        WHERE relatedUser.id <> $userId
+        RETURN type(r) AS relationshipType, relatedUser { .id, .firstName, .lastName, .email } AS relatedUserData, count(tx2) AS transactionCount
+        `,
+        { userId }
+      );
+
+      const sharedTransactionRelationships: IDirectRelationship[] =
+        sharedTransactionRelationshipsResult.records.map(
+          (record: Neo4jRecord) => ({
+            relationshipType: `${record.get('relationshipType')} (${record.get(
+              'transactionCount'
+            )} transactions)`,
+            user: record.get('relatedUserData') as Partial<IUser>,
+          })
+        );
+
+      return {
+        directRelationships,
+        transactionRelationships: sharedTransactionRelationships, 
+        sentTransactions,
+        receivedTransactions,
+      };
+    } catch (error) {
+      console.error('Error in getUserConnections:', error);
+      throw new AppError(
+        'Error while fetching user connections: ' +
+          (error instanceof Error ? error.message : String(error)),
+        500
+      );
+    } finally {
+      await session.close();
+    }
+  }
+
+  private parseTransactionProperties(
+    txNode: Neo4jNode,
+    deviceInfoNode?: Neo4jNode | null,
+    geolocationNode?: Neo4jNode | null,
+    paymentTypeNode?: Neo4jNode | null
+  ): ITransaction {
+    const txProps = txNode.properties;
+
+    const getNumber = (value: any): number => {
+      if (neo4j.isInt(value)) {
+        return value.toNumber();
+      }
+      return Number(value);
+    };
+
+    const deviceInfoContent: ITransaction['deviceInfo'] = {};
+    let hasDeviceInfoContent = false;
+
+    if (deviceInfoNode?.properties?.ipAddress) {
+      deviceInfoContent.ipAddress = deviceInfoNode.properties
+        .ipAddress as string;
+      hasDeviceInfoContent = true;
+    }
+
+    const geolocationContent: NonNullable<
+      ITransaction['deviceInfo']
+    >['geolocation'] = {};
+    let hasGeolocationContent = false;
+
+    if (geolocationNode?.properties?.city) {
+      geolocationContent.city = geolocationNode.properties.city as string;
+      hasGeolocationContent = true;
+    }
+    if (geolocationNode?.properties?.country) {
+      geolocationContent.country = geolocationNode.properties.country as string;
+      hasGeolocationContent = true;
+    }
+
+    if (hasGeolocationContent) {
+      deviceInfoContent.geolocation = geolocationContent;
+      hasDeviceInfoContent = true;
+    }
+
+    return {
+      id: txProps.id as string,
+      transactionType: txProps.transactionType as TransactionType,
+      status: txProps.status as TransactionStatus,
+      senderId: txProps.senderId as string,
+      receiverId: txProps.receiverId as string,
+      amount: getNumber(txProps.amount),
+      currency: txProps.currency as string,
+      timestamp: txProps.timestamp as string,
+      description: txProps.description as string | undefined,
+      deviceId: txProps.deviceId as string | undefined, 
+      deviceInfo: hasDeviceInfoContent ? deviceInfoContent : undefined,
+      paymentMethod: paymentTypeNode?.properties?.type as
+        | PaymentMethodType
+        | undefined,
+      destinationAmount: txProps.destinationAmount
+        ? getNumber(txProps.destinationAmount)
+        : undefined,
+      destinationCurrency: txProps.destinationCurrency as string | undefined,
+    };
   }
 }
 
