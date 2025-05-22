@@ -91,11 +91,12 @@ class TransactionModel {
         const result = await tx.run(
           `
           MATCH (sender:User {id: $senderId})
-          MATCH (receiver:User {id: $receiverId})
-          CREATE (t:Transaction {
+          MATCH (receiver:User {id: $receiverId})          CREATE (t:Transaction {
             id: randomUUID(),
             transactionType: $transactionType,
             status: $status,
+            senderId: $senderId,
+            receiverId: $receiverId,
             amount: $amount,
             currency: $currency,
             destinationAmount: $destinationAmount,
@@ -163,16 +164,12 @@ class TransactionModel {
   ): Promise<ITransaction> {
     // Update transaction properties
     const updateResult = await tx.run(
-      `
-      MATCH (t:Transaction {id: $transactionId})
+      `      MATCH (t:Transaction {id: $transactionId})
       SET t.status = $status,
           t.destinationAmount = $destinationAmount,
           t.destinationCurrency = $destinationCurrency,
           t.description = $description
-      WITH t
-      MATCH (sender:User {id: $senderId})
-      MATCH (receiver:User {id: $receiverId})
-      RETURN t, sender, receiver
+      RETURN t
       `,
       {
         transactionId,
@@ -323,14 +320,14 @@ class TransactionModel {
       );
     }
   }
-
   /**
    * Helper method to extract a basic transaction from a Neo4j record
    */ private extractTransactionFromRecord(result: any): ITransaction {
     const record = result.records[0];
     const txProps = record.get('t').properties;
-    const senderId = record.get('sender').properties.id;
-    const receiverId = record.get('receiver').properties.id;
+    // Get sender and receiver IDs from the transaction properties
+    const senderId = txProps.senderId;
+    const receiverId = txProps.receiverId;
 
     return {
       id: txProps.id,
@@ -352,6 +349,93 @@ class TransactionModel {
       description: txProps.description || undefined,
       deviceId: txProps.deviceId || undefined,
     };
+  }
+  /**
+   * Retrieves all transactions from the database with their associated data
+   *
+   * This method will:
+   * 1. Fetch all transactions
+   * 2. Include related device info, geolocation and payment method data
+   *
+   * @returns Array of transaction objects with device and payment information
+   */
+  async getAllTransactions(): Promise<ITransaction[]> {
+    const session = Neo4jService.getSession();
+
+    try {
+      // Query transactions with their associated device info and payment data, not sender/receiver
+      const result = await session.run(`
+        MATCH (t:Transaction)
+        OPTIONAL MATCH (t)-[:FROM_DEVICE]->(d:DeviceInfo)
+        OPTIONAL MATCH (d)-[:LOCATED_AT]->(g:Geolocation)
+        OPTIONAL MATCH (t)-[:USED_PAYMENT]->(p:PaymentType)
+        RETURN t, 
+               d as deviceInfo,
+               g as geolocation,
+               p as paymentType
+        ORDER BY t.timestamp DESC
+      `);
+
+      if (result.records.length === 0) {
+        return [];
+      }
+
+      return result.records.map((record) => {
+        const txProps = record.get('t').properties;
+        const deviceInfo = record.get('deviceInfo');
+        const geolocation = record.get('geolocation');
+        const paymentType = record.get('paymentType');
+        const transaction: ITransaction = {
+          id: txProps.id,
+          transactionType: txProps.transactionType,
+          status: txProps.status,
+          senderId: txProps.senderId,
+          receiverId: txProps.receiverId,
+          amount: neo4j.isInt(txProps.amount)
+            ? txProps.amount.toNumber()
+            : txProps.amount,
+          currency: txProps.currency,
+          destinationAmount: txProps.destinationAmount
+            ? neo4j.isInt(txProps.destinationAmount)
+              ? txProps.destinationAmount.toNumber()
+              : txProps.destinationAmount
+            : undefined,
+          destinationCurrency: txProps.destinationCurrency || undefined,
+          timestamp: txProps.timestamp,
+          description: txProps.description || undefined,
+          deviceId: txProps.deviceId || undefined,
+        };
+
+        // Add device info if available
+        if (deviceInfo && deviceInfo !== null) {
+          transaction.deviceInfo = {
+            ipAddress: deviceInfo.properties.ipAddress || undefined,
+          };
+
+          // Add geolocation if available
+          if (geolocation && geolocation !== null) {
+            transaction.deviceInfo.geolocation = {
+              country: geolocation.properties.country || undefined,
+              city: geolocation.properties.city || undefined,
+            };
+          }
+        }
+
+        // Add payment method if available
+        if (paymentType && paymentType !== null) {
+          transaction.paymentMethod = paymentType.properties.type;
+        }
+
+        return transaction;
+      });
+    } catch (error) {
+      throw new AppError(
+        'Error while retrieving transactions: ' +
+          (error instanceof Error ? error.message : String(error))
+      );
+    } finally {
+      session.close();
+    }
   }
 }
 

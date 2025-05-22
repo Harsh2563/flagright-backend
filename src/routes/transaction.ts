@@ -10,6 +10,7 @@ router.post(
   validateRequest(TransactionSchema),
   TransactionController.handleTransaction as RequestHandler
 );
+router.get('/',  TransactionController.getAllTransactions as RequestHandler);
 
 export default router;
 
