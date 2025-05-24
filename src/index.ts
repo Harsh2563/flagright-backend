@@ -5,6 +5,7 @@ import transactionRouter from './routes/transaction';
 import relationshipRouter from './routes/relationship';
 import 'dotenv/config';
 import morgan from 'morgan';
+import cors from 'cors';
 
 class App {
   private app: Application;
@@ -22,6 +23,12 @@ class App {
     this.app.use(morgan(isDev ? 'dev' : 'combined'));
     this.app.use(express.json());
     this.app.use(express.urlencoded({ extended: true }));
+    this.app.use(
+      cors({
+        origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000', 
+        credentials: true,
+      })
+    );
   }
 
   private setupRoutes(): void {
