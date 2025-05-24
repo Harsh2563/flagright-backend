@@ -638,7 +638,7 @@ class UserModel {
     let hasGeolocationContent = false;
 
     if (geolocationNode?.properties?.city) {
-      geolocationContent.city = geolocationNode.properties.city as string;
+      geolocationContent.state = geolocationNode.properties.atate as string;
       hasGeolocationContent = true;
     }
     if (geolocationNode?.properties?.country) {

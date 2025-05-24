@@ -21,7 +21,7 @@ export interface ITransaction {
     ipAddress?: string;
     geolocation?: {
       country?: string;
-      city?: string;
+      state?: string;
     };
   };
   paymentMethod?: PaymentMethodType;

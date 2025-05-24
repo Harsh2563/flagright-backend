@@ -3,7 +3,7 @@ import { PaymentMethodType, TransactionStatus, TransactionType } from '../types/
 
 const GeolocationSchema = z.object({
   country: z.string().optional(),
-  city: z.string().optional()
+  state: z.string().optional()
 });
 
 const DeviceInfoSchema = z.object({

@@ -246,7 +246,7 @@ class TransactionModel {
             ? `
         CREATE (g:Geolocation {
           country: $country,
-          city: $city
+          state: $state
         })
         CREATE (d)-[:LOCATED_AT]->(g)
         `
@@ -257,7 +257,7 @@ class TransactionModel {
           transactionId,
           ipAddress: transactionData.deviceInfo?.ipAddress || null,
           country: transactionData.deviceInfo?.geolocation?.country || null,
-          city: transactionData.deviceInfo?.geolocation?.city || null,
+          state: transactionData.deviceInfo?.geolocation?.state || null,
         }
       );
     }
@@ -417,7 +417,7 @@ class TransactionModel {
           if (geolocation && geolocation !== null) {
             transaction.deviceInfo.geolocation = {
               country: geolocation.properties.country || undefined,
-              city: geolocation.properties.city || undefined,
+              state: geolocation.properties.state || undefined,
             };
           }
         }
