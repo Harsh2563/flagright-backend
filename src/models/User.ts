@@ -5,14 +5,19 @@ import neo4j, {
 } from 'neo4j-driver';
 import Neo4jDriver from '../services/neo4j.service';
 import { IUser } from '../interfaces/user';
-import { ITransaction } from '../interfaces/transaction'; 
+import { ITransaction } from '../interfaces/transaction';
 import {
   TransactionStatus,
   PaymentMethodType,
   TransactionType,
 } from '../types/enums/TransactionEnums';
 import { AppError } from '../utils/appError';
-import { IConnectedTransactionInfo, IDirectRelationship, IUserConnections } from '../interfaces/relationship';
+import {
+  IConnectedTransactionInfo,
+  IDirectRelationship,
+  IUserConnections,
+} from '../interfaces/relationship';
+import { IUserSearchQuery, IUserSearchResult } from '../interfaces/userSearch';
 
 class UserModel {
   /**
@@ -385,31 +390,28 @@ class UserModel {
    *
    * @returns Array of user objects with complete address and payment information
    */
-  async getAllUsers(): Promise<IUser[]> {
+  async getAllUsers(offset = 0, limit = 10): Promise<IUser[]> {
     const session = Neo4jDriver.getSession();
-
     try {
-      // Query users with optional address and payment method relationships
-      const result = await session.run(`
+      const result = await session.run(
+        `
         MATCH (u:User)
         OPTIONAL MATCH (u)-[:HAS_ADDRESS]->(a:Address)
         OPTIONAL MATCH (u)-[:HAS_PAYMENT_METHOD]->(p:PaymentMethod)
-        RETURN u, 
-               collect(DISTINCT a) AS addresses, 
-               collect(DISTINCT p) AS paymentMethods
+        RETURN u, collect(DISTINCT a) AS addresses, collect(DISTINCT p) AS paymentMethods
         ORDER BY u.createdAt DESC
-      `);
-
+        SKIP $offset
+        LIMIT $limit
+      `,
+        { offset: neo4j.int(offset), limit: neo4j.int(limit) }
+      );
       if (result.records.length === 0) {
         return [];
       }
-
       return result.records.map((record) => {
         const userProps = record.get('u').properties;
         const addresses = record.get('addresses');
         const paymentMethods = record.get('paymentMethods');
-
-        // Extract address if available (first non-null address in collection)
         let address = undefined;
         if (addresses && addresses.length > 0 && addresses[0] !== null) {
           const addressNode = addresses[0];
@@ -421,8 +423,6 @@ class UserModel {
             country: addressNode.properties.country || undefined,
           };
         }
-
-        // Extract payment methods if available
         let userPaymentMethods = undefined;
         if (
           paymentMethods &&
@@ -430,21 +430,19 @@ class UserModel {
           paymentMethods[0] !== null
         ) {
           userPaymentMethods = paymentMethods
-            .map((payment: any) => {
-              if (payment === null) return null;
-              return {
-                id: payment.properties.id,
-                type: payment.properties.type,
-              };
-            })
+            .map((payment: any) =>
+              payment === null
+                ? null
+                : {
+                    id: payment.properties.id,
+                    type: payment.properties.type,
+                  }
+            )
             .filter((p: any) => p !== null);
-
-          // If no valid payment methods, set to undefined
           if (userPaymentMethods.length === 0) {
             userPaymentMethods = undefined;
           }
         }
-
         return {
           id: userProps.id,
           firstName: userProps.firstName,
@@ -457,11 +455,20 @@ class UserModel {
           updatedAt: userProps.updatedAt,
         };
       });
-    } catch (error) {
-      throw new AppError(
-        'Error while retrieving users: ' +
-          (error instanceof Error ? error.message : String(error))
+    } finally {
+      session.close();
+    }
+  }
+
+  // Count all users for pagination
+  async countAllUsers(): Promise<number> {
+    const session = Neo4jDriver.getSession();
+    try {
+      const result = await session.run(
+        'MATCH (u:User) RETURN COUNT(u) AS total'
       );
+      const totalValue = result.records[0].get('total');
+      return neo4j.isInt(totalValue) ? totalValue.toNumber() : totalValue;
     } finally {
       session.close();
     }
@@ -592,7 +599,7 @@ class UserModel {
 
       return {
         directRelationships,
-        transactionRelationships: sharedTransactionRelationships, 
+        transactionRelationships: sharedTransactionRelationships,
         sentTransactions,
         receivedTransactions,
       };
@@ -661,7 +668,7 @@ class UserModel {
       currency: txProps.currency as string,
       timestamp: txProps.timestamp as string,
       description: txProps.description as string | undefined,
-      deviceId: txProps.deviceId as string | undefined, 
+      deviceId: txProps.deviceId as string | undefined,
       deviceInfo: hasDeviceInfoContent ? deviceInfoContent : undefined,
       paymentMethod: paymentTypeNode?.properties?.type as
         | PaymentMethodType
@@ -670,6 +677,259 @@ class UserModel {
         ? getNumber(txProps.destinationAmount)
         : undefined,
       destinationCurrency: txProps.destinationCurrency as string | undefined,
+    };
+  }
+
+  /**
+   * Searches for users based on various criteria and returns full user details
+   * Supports filtering, searchText, pagination, and sorting
+   * @param query IUserSearchQuery
+   * @returns IUserSearchResult
+   */
+  async searchUsers(query: IUserSearchQuery): Promise<IUserSearchResult> {
+    const session = Neo4jDriver.getSession();
+    try {
+      const { searchText, page, limit, sortBy, sortOrder, filters } = query;
+      const offset = (page - 1) * limit;
+
+      // Determine if we need address/payment relationships for filtering
+      const needsAddress = this.needsAddressRelationship(searchText, filters);
+      const needsPaymentMethods = this.needsPaymentMethodRelationship(filters);
+
+      const searchConditions = this.buildSearchConditions(
+        searchText,
+        filters,
+        needsAddress,
+        needsPaymentMethods
+      );
+
+      // Build the base query with required relationships for filtering
+      let baseQuery = 'MATCH (u:User)';
+      if (
+        needsAddress &&
+        (filters.city || filters.state || filters.country || filters.postalCode)
+      ) {
+        baseQuery += '\nMATCH (u)-[:HAS_ADDRESS]->(a:Address)';
+      } else if (needsAddress) {
+        baseQuery += '\nOPTIONAL MATCH (u)-[:HAS_ADDRESS]->(a:Address)';
+      }
+      if (needsPaymentMethods) {
+        baseQuery += '\nMATCH (u)-[:HAS_PAYMENT_METHOD]->(pm:PaymentMethod)';
+      }
+
+      const countQuery = `
+      ${baseQuery}
+      ${searchConditions.whereClause}
+      RETURN COUNT(DISTINCT u) AS total
+    `;
+      const countResult = await session.run(
+        countQuery,
+        searchConditions.parameters
+      );
+      const totalValue = countResult.records[0].get('total');
+      const totalUsers = neo4j.isInt(totalValue)
+        ? totalValue.toNumber()
+        : totalValue;
+
+      const sortClause = `ORDER BY u.${sortBy} ${sortOrder.toUpperCase()}`;
+      const searchParams = {
+        ...searchConditions.parameters,
+        offset: neo4j.int(offset),
+        limit: neo4j.int(limit),
+      };
+      const searchQuery = `
+      ${baseQuery}
+      ${searchConditions.whereClause}
+      WITH DISTINCT u
+      ${sortClause}
+      SKIP $offset
+      LIMIT $limit
+      OPTIONAL MATCH (u)-[:HAS_ADDRESS]->(address_node:Address)
+      OPTIONAL MATCH (u)-[:HAS_PAYMENT_METHOD]->(pm_node:PaymentMethod)
+      RETURN u, address_node AS address, COLLECT(DISTINCT pm_node) AS paymentMethods
+    `;
+      const result = await session.run(searchQuery, searchParams);
+      const users = result.records.map((record) => {
+        const userNode = record.get('u');
+        const addressNode = record.get('address');
+        const paymentMethods = record.get('paymentMethods') || [];
+        return this.formatUserFromRecord({
+          user: userNode,
+          address: addressNode,
+          paymentMethods: paymentMethods,
+        });
+      });
+
+      const totalPages = Math.ceil(totalUsers / limit);
+      return {
+        users,
+        pagination: {
+          currentPage: page,
+          totalPages,
+          totalUsers,
+          hasNextPage: page < totalPages,
+          hasPreviousPage: page > 1,
+        },
+      };
+    } catch (error) {
+      throw new AppError('Failed to search users', 500);
+    } finally {
+      await session.close();
+    }
+  }
+
+  // Returns true if any address field is needed for search or filter
+  private needsAddressRelationship(
+    searchText?: string,
+    filters: any = {}
+  ): boolean {
+    if (searchText) return true;
+    return !!(
+      filters.city ||
+      filters.state ||
+      filters.country ||
+      filters.postalCode
+    );
+  }
+
+  // Returns true if payment method type filter is present
+  private needsPaymentMethodRelationship(filters: any = {}): boolean {
+    return (
+      Array.isArray(filters.paymentMethodTypes) &&
+      filters.paymentMethodTypes.length > 0
+    );
+  }
+
+  // Build search conditions for Cypher query
+  private buildSearchConditions(
+    searchText?: string,
+    filters: any = {},
+    includeAddressFields: boolean = false,
+    includePaymentMethodFields: boolean = false
+  ) {
+    const conditions: string[] = [];
+    const parameters: any = {};
+
+    // General search text
+    if (searchText && searchText.trim()) {
+      const searchFields = [
+        'u.firstName',
+        'u.lastName',
+        'u.email',
+        'u.phone',
+        ...(includeAddressFields
+          ? ['a.city', 'a.state', 'a.country', 'a.postalCode']
+          : []),
+      ];
+      const searchConditions = searchFields.map((field, i) => {
+        const paramName = `searchText${i}`;
+        parameters[paramName] = `(?i).*${searchText.trim()}.*`;
+        return `${field} =~ $${paramName}`;
+      });
+      conditions.push(`(${searchConditions.join(' OR ')})`);
+    }
+
+    // Specific filters: Combine all with OR
+    if (filters.firstName) {
+      parameters.firstName = `(?i).*${filters.firstName}.*`;
+      conditions.push('u.firstName =~ $firstName');
+    }
+    if (filters.lastName) {
+      parameters.lastName = `(?i).*${filters.lastName}.*`;
+      conditions.push('u.lastName =~ $lastName');
+    }
+    if (filters.email) {
+      parameters.email = `(?i).*${filters.email}.*`;
+      conditions.push('u.email =~ $email');
+    }
+    if (filters.phone) {
+      parameters.phone = filters.phone;
+      conditions.push('u.phone STARTS WITH $phone');
+    }
+    if (includeAddressFields) {
+      if (filters.city) {
+        parameters.city = filters.city;
+        conditions.push('a IS NOT NULL AND toLower(a.city) = toLower($city)');
+      }
+      if (filters.state) {
+        parameters.state = filters.state;
+        conditions.push('a IS NOT NULL AND toLower(a.state) = toLower($state)');
+      }
+      if (filters.country) {
+        parameters.country = filters.country;
+        conditions.push(
+          'a IS NOT NULL AND toLower(a.country) = toLower($country)'
+        );
+      }
+      if (filters.postalCode) {
+        parameters.postalCode = filters.postalCode;
+        conditions.push('a IS NOT NULL AND a.postalCode = $postalCode');
+      }
+    }
+    if (
+      includePaymentMethodFields &&
+      filters.paymentMethodTypes &&
+      filters.paymentMethodTypes.length > 0
+    ) {
+      parameters.paymentMethodTypes = filters.paymentMethodTypes;
+      conditions.push('pm IS NOT NULL AND pm.type IN $paymentMethodTypes');
+    }
+    if (filters.createdAfter) {
+      parameters.createdAfter = filters.createdAfter;
+      conditions.push('u.createdAt >= $createdAfter');
+    }
+    if (filters.createdBefore) {
+      parameters.createdBefore = filters.createdBefore;
+      conditions.push('u.createdAt <= $createdBefore');
+    }
+    if (filters.updatedAfter) {
+      parameters.updatedAfter = filters.updatedAfter;
+      conditions.push('u.updatedAt >= $updatedAfter');
+    }
+    if (filters.updatedBefore) {
+      parameters.updatedBefore = filters.updatedBefore;
+      conditions.push('u.updatedAt <= $updatedBefore');
+    }
+
+    const whereClause =
+      conditions.length > 0 ? `WHERE (${conditions.join(' OR ')})` : '';
+    return { whereClause, parameters };
+  }
+
+  // Format user data from Neo4j record
+  private formatUserFromRecord({ user, address, paymentMethods }: any) {
+    const userProps = user.properties || user;
+    let addressObj = undefined;
+    if (address && address.properties) {
+      addressObj = {
+        street: address.properties.street || undefined,
+        city: address.properties.city || undefined,
+        state: address.properties.state || undefined,
+        postalCode: address.properties.postalCode || undefined,
+        country: address.properties.country || undefined,
+      };
+    }
+    let paymentMethodsArr = undefined;
+    if (paymentMethods && paymentMethods.length > 0) {
+      paymentMethodsArr = paymentMethods
+        .map((pm: any) =>
+          pm && pm.properties
+            ? { id: pm.properties.id, type: pm.properties.type }
+            : null
+        )
+        .filter((pm: any) => pm !== null);
+      if (paymentMethodsArr.length === 0) paymentMethodsArr = undefined;
+    }
+    return {
+      id: userProps.id,
+      firstName: userProps.firstName,
+      lastName: userProps.lastName,
+      email: userProps.email,
+      phone: userProps.phone || undefined,
+      address: addressObj,
+      paymentMethods: paymentMethodsArr,
+      createdAt: userProps.createdAt,
+      updatedAt: userProps.updatedAt,
     };
   }
 }
