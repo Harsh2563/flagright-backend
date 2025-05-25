@@ -94,4 +94,29 @@ export default class UserController {
       next(error);
     }
   }
+
+  public static async getShortestPath(
+    req: Request, 
+    res: Response,
+    next: NextFunction) {
+    try {
+      const { startUserId, targetUserId } = req.body;
+
+      const path = await UserModel.findShortestPathBetweenUsers(startUserId, targetUserId);
+
+      return res.status(200).json({
+        status: 'success',
+        data: path,
+      });
+    } catch (error) {
+      if (error instanceof AppError) {
+        return res.status(error.statusCode).json({
+          status: 'error',
+          message: error.message,
+        });
+      }
+      console.error('Error in getShortestPath:', error);
+      next(error);
+    }
+}
 }

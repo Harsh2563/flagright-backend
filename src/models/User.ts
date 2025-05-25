@@ -18,6 +18,7 @@ import {
   IUserConnections,
 } from '../interfaces/relationship';
 import { IUserSearchQuery, IUserSearchResult } from '../interfaces/userSearch';
+import {IShortestPathResult} from '../interfaces/shortestPath';
 
 class UserModel {
   /**
@@ -955,6 +956,236 @@ class UserModel {
       createdAt: userProps.createdAt,
       updatedAt: userProps.updatedAt,
     };
+  }
+
+  /**
+   * Finds the shortest path between two users in the transaction graph
+   *
+   * This method uses Neo4j's shortestPath function to find the shortest sequence of transactions
+   * connecting two users via SENT and RECEIVED_BY relationships.
+   *
+   * @param userId1 ID of the first user
+   * @param userId2 ID of the second user
+   * @returns ShortestPathResult containing the path and its length
+   * @throws AppError if users are not found or no path exists
+   */
+  async findShortestPathBetweenUsers(
+    userId1: string,
+    userId2: string
+  ): Promise<IShortestPathResult> {
+    const session = Neo4jDriver.getSession();
+    try {
+      // Verify that both users exist
+      const userCheckResult = await session.run(
+        `
+      MATCH (u1:User {id: $userId1})
+      MATCH (u2:User {id: $userId2})
+      RETURN u1, u2
+      `,
+        { userId1, userId2 }
+      );
+
+      if (userCheckResult.records.length === 0) {
+        throw new AppError(
+          `One or both users not found: ${userId1}, ${userId2}`,
+          404
+        );
+      }
+
+      // Find the shortest path between the two users
+      const result = await session.run(
+        `
+      MATCH (u1:User {id: $userId1})
+      MATCH (u2:User {id: $userId2})
+      MATCH path = shortestPath((u1)-[:SENT|RECEIVED_BY*]-(u2))
+      WHERE u1 <> u2
+      WITH path
+      UNWIND nodes(path) AS node
+      UNWIND relationships(path) AS rel
+      RETURN collect(distinct node) AS nodes, collect(distinct rel) AS relationships, length(path) AS pathLength
+      `,
+        { userId1, userId2 }
+      );
+
+      if (result.records.length === 0) {
+        throw new AppError(
+          `No path exists between users ${userId1} and ${userId2}`,
+          404
+        );
+      }
+
+      const record = result.records[0];
+
+      // Process nodes and create a map of internal IDs to node IDs
+      const nodesRaw = record.get('nodes');
+      const nodes = nodesRaw.map((node: any) => ({
+        type: node.labels.includes('User') ? 'User' : 'Transaction',
+        properties: node.properties,
+      }));
+
+      // Create a map of internal node IDs to their id properties
+      const nodeIdMap: { [key: string]: string } = {};
+      nodesRaw.forEach((node: any) => {
+        const internalId = neo4j.isInt(node.identity)
+          ? node.identity.toString()
+          : String(node.identity);
+        nodeIdMap[internalId] = node.properties.id;
+      });
+      console.log('Node ID Map:', nodeIdMap);
+
+      // Process relationships
+      const relationshipsRaw = record.get('relationships') || [];
+      console.log('Relationships raw data:', relationshipsRaw);
+
+      const relationships = relationshipsRaw
+        .filter((rel: any) => {
+          const hasStartAndEnd =
+            rel && rel.start !== undefined && rel.end !== undefined;
+          if (!hasStartAndEnd) {
+            console.log(
+              'Filtered out invalid relationship (missing start/end):',
+              rel
+            );
+            return false;
+          }
+          return true;
+        })
+        .map((rel: any, index: number) => {
+          // Convert start and end to strings (internal node IDs)
+          const startInternalId = neo4j.isInt(rel.start)
+            ? rel.start.toString()
+            : String(rel.start);
+          const endInternalId = neo4j.isInt(rel.end)
+            ? rel.end.toString()
+            : String(rel.end);
+
+          // Map internal IDs to the id properties from the nodes
+          const startNodeId = nodeIdMap[startInternalId];
+          const endNodeId = nodeIdMap[endInternalId];
+
+          if (!startNodeId || !endNodeId) {
+            console.log(
+              `Missing mapping for relationship: type=${rel.type}, startInternalId=${startInternalId}, endInternalId=${endInternalId}`
+            );
+            return null;
+          }
+
+          // Determine the expected direction based on the path
+          const expectedStartId = nodes[index].properties.id;
+          const expectedEndId = nodes[index + 1].properties.id;
+
+          // Determine the node types for validation
+          const startNodeType = nodes[index].type;
+          const endNodeType = nodes[index + 1].type;
+
+          // Adjust direction and type based on traversal
+          let finalStartNodeId = startNodeId;
+          let finalEndNodeId = endNodeId;
+          let finalType = rel.type;
+
+          const isForward =
+            startNodeId === expectedStartId && endNodeId === expectedEndId;
+          const isReversed =
+            startNodeId === expectedEndId && endNodeId === expectedStartId;
+
+          if (!isForward && !isReversed) {
+            console.log(
+              `Relationship does not align with path: type=${rel.type}, start=${startNodeId}, end=${endNodeId}, expectedStart=${expectedStartId}, expectedEnd=${expectedEndId}`
+            );
+            return null;
+          }
+
+          if (isReversed) {
+            // Swap start and end
+            finalStartNodeId = endNodeId;
+            finalEndNodeId = startNodeId;
+            finalType = rel.type === 'SENT' ? 'RECEIVED_BY' : 'SENT';
+          }
+
+          // Validate the relationship type based on node types
+          if (
+            finalType === 'SENT' &&
+            (startNodeType !== 'User' || endNodeType !== 'Transaction')
+          ) {
+            console.log(
+              `Invalid SENT relationship: startNodeType=${startNodeType}, endNodeType=${endNodeType}`
+            );
+            return null;
+          }
+          if (
+            finalType === 'RECEIVED_BY' &&
+            (startNodeType !== 'Transaction' || endNodeType !== 'User')
+          ) {
+            console.log(
+              `Invalid RECEIVED_BY relationship: startNodeType=${startNodeType}, endNodeType=${endNodeType}`
+            );
+            return null;
+          }
+
+          console.log(
+            `Processing relationship: type=${finalType}, start=${finalStartNodeId}, end=${finalEndNodeId}`
+          );
+
+          return {
+            type: finalType,
+            startNodeId: finalStartNodeId,
+            endNodeId: finalEndNodeId,
+          };
+        })
+        .filter((rel: any) => rel !== null);
+
+      if (relationships.length === 0 && relationshipsRaw.length > 0) {
+        console.warn(
+          'All relationships were filtered out. Check the relationship structure.'
+        );
+      }
+
+      const rawPathLength = record.get('pathLength');
+      console.log(
+        'Raw pathLength:',
+        rawPathLength,
+        'Type:',
+        typeof rawPathLength
+      );
+
+      let pathLength: number;
+      if (neo4j.isInt(rawPathLength)) {
+        pathLength = rawPathLength.toNumber();
+      } else if (typeof rawPathLength === 'number') {
+        pathLength = rawPathLength;
+      } else {
+        throw new AppError(
+          `Unexpected type for pathLength: ${typeof rawPathLength}`,
+          500
+        );
+      }
+
+      if (relationships.length !== pathLength) {
+        throw new AppError(
+          `Mismatch between path length (${pathLength}) and number of relationships (${relationships.length})`,
+          500
+        );
+      }
+
+      return {
+        path: {
+          nodes,
+          relationships,
+        },
+        length: pathLength,
+      };
+    } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
+      throw new AppError(
+        'Error while finding shortest path: ' +
+          (error instanceof Error ? error.message : String(error)),
+        500
+      );
+    } finally {
+      await session.close();
+    }
   }
 }
 

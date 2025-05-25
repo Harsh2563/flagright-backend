@@ -23,3 +23,8 @@ export const UserSchema = z.object({
   address: AddressSchema.optional(),
   paymentMethods: z.array(PaymentMethodSchema).optional(),
 });
+
+export const ShortestPath = z.object({
+  startUserId: z.string().uuid('Invalid user ID format'),  
+  targetUserId: z.string().uuid('Invalid user ID format'),
+})
