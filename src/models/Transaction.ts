@@ -3,6 +3,10 @@ import Neo4jService from '../services/neo4j.service';
 import { ITransaction } from '../interfaces/transaction';
 import { AppError } from '../utils/appError';
 import { ITransactionConnections } from '../interfaces/relationship';
+import {
+  ITransactionSearchQuery,
+  ITransactionSearchResult,
+} from '../interfaces/transactionSearch';
 
 class TransactionModel {
   /**
@@ -80,7 +84,7 @@ class TransactionModel {
           );
         }
 
-        //check if sender and receiver are the same
+        // Check if sender and receiver are the same
         if (transactionData.senderId === transactionData.receiverId) {
           throw new AppError(
             `Sender and receiver cannot be the same user`,
@@ -92,7 +96,8 @@ class TransactionModel {
         const result = await tx.run(
           `
           MATCH (sender:User {id: $senderId})
-          MATCH (receiver:User {id: $receiverId})          CREATE (t:Transaction {
+          MATCH (receiver:User {id: $receiverId})
+          CREATE (t:Transaction {
             id: randomUUID(),
             transactionType: $transactionType,
             status: $status,
@@ -158,14 +163,16 @@ class TransactionModel {
    * @param transactionData New transaction data to apply
    * @param tx Active Neo4j transaction
    * @returns Updated transaction data
-   */ private async updateExistingTransaction(
+   */
+  private async updateExistingTransaction(
     transactionId: string,
     transactionData: Partial<ITransaction>,
     tx: any
   ): Promise<ITransaction> {
     // Update transaction properties
     const updateResult = await tx.run(
-      `      MATCH (t:Transaction {id: $transactionId})
+      `
+      MATCH (t:Transaction {id: $transactionId})
       SET t.status = $status,
           t.destinationAmount = $destinationAmount,
           t.destinationCurrency = $destinationCurrency,
@@ -227,7 +234,8 @@ class TransactionModel {
    * @param transactionId ID of the transaction
    * @param transactionData Transaction data containing related information
    * @param tx Active Neo4j transaction
-   */ private async createRelatedEntities(
+   */
+  private async createRelatedEntities(
     transactionId: string,
     transactionData: Partial<ITransaction>,
     tx: any
@@ -290,7 +298,8 @@ class TransactionModel {
    * @param transactionId ID of the transaction to create relationships for
    * @param transactionData Transaction data containing attributes to check for sharing
    * @param tx Active Neo4j transaction
-   */ private async createSharedRelationships(
+   */
+  private async createSharedRelationships(
     transactionId: string,
     transactionData: Partial<ITransaction>,
     tx: any
@@ -321,9 +330,11 @@ class TransactionModel {
       );
     }
   }
+
   /**
    * Helper method to extract a basic transaction from a Neo4j record
-   */ private extractTransactionFromRecord(result: any): ITransaction {
+   */
+  private extractTransactionFromRecord(result: any): ITransaction {
     const record = result.records[0];
     const txProps = record.get('t').properties;
     // Get sender and receiver IDs from the transaction properties
@@ -351,6 +362,7 @@ class TransactionModel {
       deviceId: txProps.deviceId || undefined,
     };
   }
+
   /**
    * Retrieves all transactions from the database with their associated data
    *
@@ -360,80 +372,58 @@ class TransactionModel {
    *
    * @returns Array of transaction objects with device and payment information
    */
-  async getAllTransactions(): Promise<ITransaction[]> {
+  async getAllTransactions(
+    offset = 0,
+    limit = 10
+  ): Promise<{ transactions: ITransaction[]; pagination: any }> {
     const session = Neo4jService.getSession();
-
     try {
-      // Query transactions with their associated device info and payment data, not sender/receiver
-      const result = await session.run(`
+      const result = await session.run(
+        `
         MATCH (t:Transaction)
-        OPTIONAL MATCH (t)-[:FROM_DEVICE]->(d:DeviceInfo)
-        OPTIONAL MATCH (d)-[:LOCATED_AT]->(g:Geolocation)
         OPTIONAL MATCH (t)-[:USED_PAYMENT]->(p:PaymentType)
-        RETURN t, 
-               d as deviceInfo,
-               g as geolocation,
-               p as paymentType
+        RETURN t, p
         ORDER BY t.timestamp DESC
-      `);
-
-      if (result.records.length === 0) {
-        return [];
-      }
-
-      return result.records.map((record) => {
-        const txProps = record.get('t').properties;
-        const deviceInfo = record.get('deviceInfo');
-        const geolocation = record.get('geolocation');
-        const paymentType = record.get('paymentType');
-        const transaction: ITransaction = {
-          id: txProps.id,
-          transactionType: txProps.transactionType,
-          status: txProps.status,
-          senderId: txProps.senderId,
-          receiverId: txProps.receiverId,
-          amount: neo4j.isInt(txProps.amount)
-            ? txProps.amount.toNumber()
-            : txProps.amount,
-          currency: txProps.currency,
-          destinationAmount: txProps.destinationAmount
-            ? neo4j.isInt(txProps.destinationAmount)
-              ? txProps.destinationAmount.toNumber()
-              : txProps.destinationAmount
-            : undefined,
-          destinationCurrency: txProps.destinationCurrency || undefined,
-          timestamp: txProps.timestamp,
-          description: txProps.description || undefined,
-          deviceId: txProps.deviceId || undefined,
-        };
-
-        // Add device info if available
-        if (deviceInfo && deviceInfo !== null) {
-          transaction.deviceInfo = {
-            ipAddress: deviceInfo.properties.ipAddress || undefined,
-          };
-
-          // Add geolocation if available
-          if (geolocation && geolocation !== null) {
-            transaction.deviceInfo.geolocation = {
-              country: geolocation.properties.country || undefined,
-              state: geolocation.properties.state || undefined,
-            };
-          }
-        }
-
-        // Add payment method if available
-        if (paymentType && paymentType !== null) {
-          transaction.paymentMethod = paymentType.properties.type;
-        }
-
-        return transaction;
-      });
-    } catch (error) {
-      throw new AppError(
-        'Error while retrieving transactions: ' +
-          (error instanceof Error ? error.message : String(error))
+        SKIP $offset
+        LIMIT $limit
+      `,
+        { offset: neo4j.int(offset), limit: neo4j.int(limit) }
       );
+      const countResult = await session.run(
+        'MATCH (t:Transaction) RETURN COUNT(t) AS total'
+      );
+      const totalValue = countResult.records[0].get('total');
+      const totalTransactions =
+        typeof totalValue === 'object' && totalValue.toNumber
+          ? totalValue.toNumber()
+          : totalValue;
+      const totalPages = Math.ceil(totalTransactions / limit);
+      const transactions = result.records.map((record) => {
+        const t = record.get('t').properties;
+        const p = record.get('p')?.properties;
+        return {
+          ...t,
+          amount:
+            typeof t.amount === 'object' && t.amount.toNumber
+              ? t.amount.toNumber()
+              : t.amount,
+          destinationAmount:
+            t.destinationAmount && t.destinationAmount.toNumber
+              ? t.destinationAmount.toNumber()
+              : t.destinationAmount,
+          paymentMethod: p ? p.type : undefined,
+        };
+      });
+      return {
+        transactions,
+        pagination: {
+          currentPage: Math.floor(offset / limit) + 1,
+          totalPages,
+          totalTransactions,
+          hasNextPage: offset / limit + 1 < totalPages,
+          hasPreviousPage: offset / limit + 1 > 1,
+        },
+      };
     } finally {
       session.close();
     }
@@ -529,6 +519,226 @@ class TransactionModel {
       );
     } finally {
       session.close();
+    }
+  }
+
+  /**
+   * Determines if the PaymentMethod relationship is needed based on the query
+   */
+  private needsPaymentMethodRelationship(filters: any): boolean {
+    return !!filters.paymentMethod;
+  }
+
+  /**
+   * Builds search conditions for the transaction query
+   */
+  private buildSearchConditions(
+    searchText: string | undefined,
+    filters: any
+  ): { whereClause: string; parameters: any } {
+    const conditions: string[] = [];
+    const params: any = {};
+
+    // General search text
+    if (searchText && searchText.trim()) {
+      const searchFields = [
+        't.id',
+        't.description',
+        't.currency',
+        't.deviceId',
+      ];
+      const searchConds = searchFields.map((field, i) => {
+        const paramName = `searchText${i}`;
+        params[paramName] = `(?i).*${searchText.trim()}.*`;
+        return `${field} =~ $${paramName}`;
+      });
+      conditions.push(`(${searchConds.join(' OR ')})`);
+    }
+
+    // Filters
+    if (filters.transactionType) {
+      params.transactionType = filters.transactionType;
+      conditions.push('t.transactionType = $transactionType');
+    }
+    if (filters.status) {
+      params.status = filters.status;
+      conditions.push('t.status = $status');
+    }
+    if (filters.senderId) {
+      params.senderId = filters.senderId;
+      conditions.push('t.senderId = $senderId');
+    }
+    if (filters.receiverId) {
+      params.receiverId = filters.receiverId;
+      conditions.push('t.receiverId = $receiverId');
+    }
+    if (filters.currency) {
+      params.currency = filters.currency;
+      conditions.push('t.currency = $currency');
+    }
+    if (filters.paymentMethod) {
+      params.paymentMethod = filters.paymentMethod;
+      conditions.push('pt IS NOT NULL AND pt.type = $paymentMethod');
+    }
+    if (filters.amountMin !== undefined) {
+      params.amountMin = neo4j.int(filters.amountMin);
+      conditions.push('t.amount >= $amountMin');
+    }
+    if (filters.amountMax !== undefined) {
+      params.amountMax = neo4j.int(filters.amountMax);
+      conditions.push('t.amount <= $amountMax');
+    }
+    if (filters.createdAfter) {
+      params.createdAfter = filters.createdAfter;
+      conditions.push('t.timestamp >= $createdAfter');
+    }
+    if (filters.createdBefore) {
+      params.createdBefore = filters.createdBefore;
+      conditions.push('t.timestamp <= $createdBefore');
+    }
+    if (filters.description) {
+      params.description = `(?i).*${filters.description}.*`;
+      conditions.push(
+        't.description IS NOT NULL AND t.description =~ $description'
+      );
+    }
+
+    const whereClause =
+      conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    return { whereClause, parameters: params };
+  }
+
+  /**
+   * Formats a transaction record from Neo4j into the ITransaction interface
+   */
+  private formatTransactionFromRecord(record: {
+    transaction: any;
+    paymentMethods: any[];
+  }): ITransaction {
+    const { transaction, paymentMethods } = record;
+    const props = transaction.properties;
+    return {
+      id: props.id,
+      transactionType: props.transactionType,
+      status: props.status,
+      senderId: props.senderId,
+      receiverId: props.receiverId,
+      amount: neo4j.isInt(props.amount)
+        ? props.amount.toNumber()
+        : props.amount,
+      currency: props.currency,
+      destinationAmount: props.destinationAmount
+        ? neo4j.isInt(props.destinationAmount)
+          ? props.destinationAmount.toNumber()
+          : props.destinationAmount
+        : undefined,
+      destinationCurrency: props.destinationCurrency || undefined,
+      timestamp: props.timestamp,
+      description: props.description || undefined,
+      deviceId: props.deviceId || undefined,
+      paymentMethod:
+        paymentMethods.length > 0
+          ? paymentMethods[0].properties.type
+          : undefined,
+    };
+  }
+
+  /**
+   * Searches for transactions based on various criteria
+   *
+   * This method supports filtering by transaction attributes, pagination, and sorting.
+   *
+   * @param query Search and filter criteria
+   * @returns A paginated and sorted list of transactions matching the criteria
+   */
+  async searchTransactions(
+    query: ITransactionSearchQuery
+  ): Promise<ITransactionSearchResult> {
+    const session = Neo4jService.getSession();
+    try {
+      const { searchText, page, limit, sortBy, sortOrder, filters } = query;
+      const offset = (page - 1) * limit;
+
+      // Map sortBy field (e.g., createdAt to timestamp)
+      const mappedSortBy = sortBy === 'createdAt' ? 'timestamp' : sortBy;
+
+      // Determine if we need the PaymentMethod relationship for filtering
+      const needsPaymentMethods = this.needsPaymentMethodRelationship(filters);
+
+      // Build search conditions
+      const searchConditions = this.buildSearchConditions(searchText, filters);
+
+      // Build the base query with required relationships for filtering
+      let baseQuery = 'MATCH (t:Transaction)';
+      if (needsPaymentMethods) {
+        baseQuery += '\nMATCH (t)-[:USED_PAYMENT]->(pt:PaymentType)';
+      }
+
+      // Count query
+      const countQuery = `
+        ${baseQuery}
+        ${searchConditions.whereClause}
+        RETURN COUNT(DISTINCT t) AS total
+      `;
+      const countResult = await session.run(
+        countQuery,
+        searchConditions.parameters
+      );
+      const totalValue = countResult.records[0].get('total');
+      const totalTransactions = neo4j.isInt(totalValue)
+        ? totalValue.toNumber()
+        : totalValue;
+
+      // Main search query
+      const sortClause = `ORDER BY t.${mappedSortBy} ${sortOrder.toUpperCase()}`;
+      const searchParams = {
+        ...searchConditions.parameters,
+        offset: neo4j.int(offset),
+        limit: neo4j.int(limit),
+      };
+      const searchQuery = `
+        ${baseQuery}
+        ${searchConditions.whereClause}
+        WITH DISTINCT t
+        ${sortClause}
+        SKIP $offset
+        LIMIT $limit
+        OPTIONAL MATCH (t)-[:USED_PAYMENT]->(pt_node:PaymentType)
+        RETURN t, COLLECT(DISTINCT pt_node) AS paymentMethods
+      `;
+      const result = await session.run(searchQuery, searchParams);
+
+      const transactions = result.records.map((record) => {
+        const transactionNode = record.get('t');
+        const paymentMethods = record.get('paymentMethods') || [];
+        return this.formatTransactionFromRecord({
+          transaction: transactionNode,
+          paymentMethods,
+        });
+      });
+
+      const totalPages =
+        totalTransactions > 0 ? Math.ceil(totalTransactions / limit) : 1;
+      const currentPage = Math.min(page, totalPages);
+
+      return {
+        transactions,
+        pagination: {
+          currentPage,
+          totalPages,
+          totalTransactions,
+          hasNextPage: currentPage < totalPages,
+          hasPreviousPage: currentPage > 1,
+        },
+      };
+    } catch (error) {
+      throw new AppError(
+        'Failed to search transactions: ' +
+          (error instanceof Error ? error.message : String(error)),
+        500
+      );
+    } finally {
+      await session.close();
     }
   }
 }
