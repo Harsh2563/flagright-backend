@@ -21,7 +21,6 @@ import { IUserSearchQuery, IUserSearchResult } from '../interfaces/userSearch';
 
 class UserModel {
   /**
-  /**
    * Upserts a user (updates if ID is provided, otherwise creates new)
    *
    * This method will:
@@ -388,33 +387,51 @@ class UserModel {
   /**
    * Retrieves all users from the database with their associated address and payment details
    *
-   * @returns Array of user objects with complete address and payment information
+   * This method will:
+   * 1. Fetch all users with their address and payment methods
+   * 2. Include pagination metadata
+   *
+   * @param offset Number of users to skip (default: 0)
+   * @param limit Number of users to fetch (default: 10)
+   * @returns Object containing an array of users and pagination metadata
    */
-  async getAllUsers(offset = 0, limit = 10): Promise<IUser[]> {
+  async getAllUsers(
+    offset = 0,
+    limit = 10
+  ): Promise<{ users: IUser[]; pagination: any }> {
     const session = Neo4jDriver.getSession();
     try {
+      // Count total users
+      const countResult = await session.run(
+        'MATCH (u:User) RETURN COUNT(u) AS total'
+      );
+      const totalValue = countResult.records[0].get('total');
+      const totalUsers = neo4j.isInt(totalValue)
+        ? totalValue.toNumber()
+        : totalValue;
+      const totalPages = Math.ceil(totalUsers / limit);
+
+      // Fetch users with address and payment methods
       const result = await session.run(
         `
         MATCH (u:User)
         OPTIONAL MATCH (u)-[:HAS_ADDRESS]->(a:Address)
         OPTIONAL MATCH (u)-[:HAS_PAYMENT_METHOD]->(p:PaymentMethod)
-        RETURN u, collect(DISTINCT a) AS addresses, collect(DISTINCT p) AS paymentMethods
+        RETURN u, a, COLLECT(DISTINCT p) AS paymentMethods
         ORDER BY u.createdAt DESC
         SKIP $offset
         LIMIT $limit
-      `,
+        `,
         { offset: neo4j.int(offset), limit: neo4j.int(limit) }
       );
-      if (result.records.length === 0) {
-        return [];
-      }
-      return result.records.map((record) => {
+
+      const users = result.records.map((record) => {
         const userProps = record.get('u').properties;
-        const addresses = record.get('addresses');
-        const paymentMethods = record.get('paymentMethods');
+        const addressNode = record.get('a');
+        const paymentMethods = record.get('paymentMethods') || [];
+
         let address = undefined;
-        if (addresses && addresses.length > 0 && addresses[0] !== null) {
-          const addressNode = addresses[0];
+        if (addressNode) {
           address = {
             street: addressNode.properties.street || undefined,
             city: addressNode.properties.city || undefined,
@@ -423,54 +440,52 @@ class UserModel {
             country: addressNode.properties.country || undefined,
           };
         }
+
         let userPaymentMethods = undefined;
-        if (
-          paymentMethods &&
-          paymentMethods.length > 0 &&
-          paymentMethods[0] !== null
-        ) {
+        if (paymentMethods && paymentMethods.length > 0) {
           userPaymentMethods = paymentMethods
             .map((payment: any) =>
-              payment === null
-                ? null
-                : {
-                    id: payment.properties.id,
-                    type: payment.properties.type,
-                  }
+              payment
+                ? { id: payment.properties.id, type: payment.properties.type }
+                : null
             )
             .filter((p: any) => p !== null);
           if (userPaymentMethods.length === 0) {
             userPaymentMethods = undefined;
           }
         }
+
         return {
           id: userProps.id,
           firstName: userProps.firstName,
           lastName: userProps.lastName,
           email: userProps.email,
           phone: userProps.phone || undefined,
-          address: address,
+          address,
           paymentMethods: userPaymentMethods,
           createdAt: userProps.createdAt,
           updatedAt: userProps.updatedAt,
         };
       });
-    } finally {
-      session.close();
-    }
-  }
 
-  // Count all users for pagination
-  async countAllUsers(): Promise<number> {
-    const session = Neo4jDriver.getSession();
-    try {
-      const result = await session.run(
-        'MATCH (u:User) RETURN COUNT(u) AS total'
+      return {
+        users,
+        pagination: {
+          currentPage: Math.floor(offset / limit) + 1,
+          totalPages,
+          totalUsers,
+          hasNextPage: offset / limit + 1 < totalPages,
+          hasPreviousPage: offset / limit + 1 > 1,
+        },
+      };
+    } catch (error) {
+      throw new AppError(
+        'Failed to fetch users: ' +
+          (error instanceof Error ? error.message : String(error)),
+        500
       );
-      const totalValue = result.records[0].get('total');
-      return neo4j.isInt(totalValue) ? totalValue.toNumber() : totalValue;
     } finally {
-      session.close();
+      await session.close();
     }
   }
 
@@ -684,7 +699,7 @@ class UserModel {
    * Searches for users based on various criteria and returns full user details
    * Supports filtering, searchText, pagination, and sorting
    * @param query IUserSearchQuery
-   * @returns IUserSearchResult
+   * @returns IUserSearchResult with pagination metadata
    */
   async searchUsers(query: IUserSearchQuery): Promise<IUserSearchResult> {
     const session = Neo4jDriver.getSession();
@@ -717,11 +732,12 @@ class UserModel {
         baseQuery += '\nMATCH (u)-[:HAS_PAYMENT_METHOD]->(pm:PaymentMethod)';
       }
 
+      // Count query
       const countQuery = `
-      ${baseQuery}
-      ${searchConditions.whereClause}
-      RETURN COUNT(DISTINCT u) AS total
-    `;
+        ${baseQuery}
+        ${searchConditions.whereClause}
+        RETURN COUNT(DISTINCT u) AS total
+      `;
       const countResult = await session.run(
         countQuery,
         searchConditions.parameters
@@ -731,6 +747,7 @@ class UserModel {
         ? totalValue.toNumber()
         : totalValue;
 
+      // Main search query
       const sortClause = `ORDER BY u.${sortBy} ${sortOrder.toUpperCase()}`;
       const searchParams = {
         ...searchConditions.parameters,
@@ -738,17 +755,18 @@ class UserModel {
         limit: neo4j.int(limit),
       };
       const searchQuery = `
-      ${baseQuery}
-      ${searchConditions.whereClause}
-      WITH DISTINCT u
-      ${sortClause}
-      SKIP $offset
-      LIMIT $limit
-      OPTIONAL MATCH (u)-[:HAS_ADDRESS]->(address_node:Address)
-      OPTIONAL MATCH (u)-[:HAS_PAYMENT_METHOD]->(pm_node:PaymentMethod)
-      RETURN u, address_node AS address, COLLECT(DISTINCT pm_node) AS paymentMethods
-    `;
+        ${baseQuery}
+        ${searchConditions.whereClause}
+        WITH DISTINCT u
+        ${sortClause}
+        SKIP $offset
+        LIMIT $limit
+        OPTIONAL MATCH (u)-[:HAS_ADDRESS]->(address_node:Address)
+        OPTIONAL MATCH (u)-[:HAS_PAYMENT_METHOD]->(pm_node:PaymentMethod)
+        RETURN u, address_node AS address, COLLECT(DISTINCT pm_node) AS paymentMethods
+      `;
       const result = await session.run(searchQuery, searchParams);
+
       const users = result.records.map((record) => {
         const userNode = record.get('u');
         const addressNode = record.get('address');
@@ -760,19 +778,25 @@ class UserModel {
         });
       });
 
-      const totalPages = Math.ceil(totalUsers / limit);
+      const totalPages = totalUsers > 0 ? Math.ceil(totalUsers / limit) : 1;
+      const currentPage = Math.min(page, totalPages);
+
       return {
         users,
         pagination: {
-          currentPage: page,
+          currentPage,
           totalPages,
           totalUsers,
-          hasNextPage: page < totalPages,
-          hasPreviousPage: page > 1,
+          hasNextPage: currentPage < totalPages,
+          hasPreviousPage: currentPage > 1,
         },
       };
     } catch (error) {
-      throw new AppError('Failed to search users', 500);
+      throw new AppError(
+        'Failed to search users: ' +
+          (error instanceof Error ? error.message : String(error)),
+        500
+      );
     } finally {
       await session.close();
     }
@@ -829,7 +853,7 @@ class UserModel {
       conditions.push(`(${searchConditions.join(' OR ')})`);
     }
 
-    // Specific filters: Combine all with OR
+    // Specific filters: Combine all with AND
     if (filters.firstName) {
       parameters.firstName = `(?i).*${filters.firstName}.*`;
       conditions.push('u.firstName =~ $firstName');
@@ -892,7 +916,7 @@ class UserModel {
     }
 
     const whereClause =
-      conditions.length > 0 ? `WHERE (${conditions.join(' OR ')})` : '';
+      conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
     return { whereClause, parameters };
   }
 

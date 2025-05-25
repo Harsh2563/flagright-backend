@@ -44,25 +44,14 @@ export default class UserController {
       const page = Math.max(Number(req.query.page) || 1, 1);
       const limit = Math.max(Number(req.query.limit) || 10, 1);
       const offset = (page - 1) * limit;
-
-      // Fetch all users (with skip/limit for pagination)
-      const users = await UserModel.getAllUsers(offset, limit);
-      // Get total count for pagination
-      const totalUsers = await UserModel.countAllUsers();
-      const totalPages = Math.ceil(totalUsers / limit);
+      const {users, pagination} = await UserModel.getAllUsers(offset, limit);
 
       return res.status(200).json({
         status: 'success',
         results: users.length,
         data: {
           users,
-          pagination: {
-            currentPage: page,
-            totalPages,
-            totalUsers,
-            hasNextPage: page < totalPages,
-            hasPreviousPage: page > 1,
-          },
+          pagination,
         },
       });
     } catch (error) {
