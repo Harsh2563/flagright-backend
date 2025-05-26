@@ -393,12 +393,12 @@ class UserModel {
    * 2. Include pagination metadata
    *
    * @param offset Number of users to skip (default: 0)
-   * @param limit Number of users to fetch (default: 10)
+   * @param limit Number of users to fetch (default: 30)
    * @returns Object containing an array of users and pagination metadata
    */
   async getAllUsers(
     offset = 0,
-    limit = 10
+    limit = 30
   ): Promise<{ users: IUser[]; pagination: any }> {
     const session = Neo4jDriver.getSession();
     try {

@@ -142,6 +142,14 @@ class TransactionModel {
           tx
         );
 
+        const deviceInfo = await this.getTransactionDeviceInfo(
+          transaction.id,
+          tx
+        );
+        if (deviceInfo) {
+          transaction.deviceInfo = deviceInfo;
+        }
+
         await tx.commit();
         return { transaction, isNew: true };
       } catch (error) {
@@ -169,24 +177,102 @@ class TransactionModel {
     transactionData: Partial<ITransaction>,
     tx: any
   ): Promise<ITransaction> {
-    // Update transaction properties
+    if (transactionData.senderId) {
+      const senderResult = await tx.run('MATCH (u:User {id: $id}) RETURN u', {
+        id: transactionData.senderId,
+      });
+      if (senderResult.records.length === 0) {
+        throw new AppError(
+          `Sender with ID ${transactionData.senderId} not found`,
+          404
+        );
+      }
+    }
+
+    if (transactionData.receiverId) {
+      const receiverResult = await tx.run('MATCH (u:User {id: $id}) RETURN u', {
+        id: transactionData.receiverId,
+      });
+      if (receiverResult.records.length === 0) {
+        throw new AppError(
+          `Receiver with ID ${transactionData.receiverId} not found`,
+          404
+        );
+      }
+    }
+
+    // Check if sender and receiver are the same, if both are provided
+    if (
+      transactionData.senderId &&
+      transactionData.receiverId &&
+      transactionData.senderId === transactionData.receiverId
+    ) {
+      throw new AppError(`Sender and receiver cannot be the same user`, 400);
+    }
+
+    if (transactionData.senderId || transactionData.receiverId) {
+      await tx.run(
+        `
+        MATCH (t:Transaction {id: $transactionId})-[r:SENT|RECEIVED_BY]-()
+        DELETE r
+        `,
+        { transactionId }
+      );
+
+      // Create new relationships
+      await tx.run(
+        `
+        MATCH (t:Transaction {id: $transactionId})
+        MATCH (sender:User {id: $senderId})
+        MATCH (receiver:User {id: $receiverId})
+        CREATE (sender)-[:SENT]->(t)
+        CREATE (t)-[:RECEIVED_BY]->(receiver)
+        `,
+        {
+          transactionId,
+          senderId:
+            transactionData.senderId ||
+            (await this.getCurrentSenderId(transactionId, tx)),
+          receiverId:
+            transactionData.receiverId ||
+            (await this.getCurrentReceiverId(transactionId, tx)),
+        }
+      );
+    }
+
     const updateResult = await tx.run(
       `
       MATCH (t:Transaction {id: $transactionId})
-      SET t.status = $status,
+      SET t.transactionType = $transactionType,
+          t.status = $status,
+          t.senderId = $senderId,
+          t.receiverId = $receiverId,
+          t.amount = $amount,
+          t.currency = $currency,
           t.destinationAmount = $destinationAmount,
           t.destinationCurrency = $destinationCurrency,
-          t.description = $description
+          t.timestamp = $timestamp,
+          t.description = $description,
+          t.deviceId = $deviceId
       RETURN t
       `,
       {
         transactionId,
-        status: transactionData.status,
+        transactionType: transactionData.transactionType ?? null,
+        status: transactionData.status ?? null,
+        senderId:
+          transactionData.senderId ||
+          (await this.getCurrentSenderId(transactionId, tx)),
+        receiverId:
+          transactionData.receiverId ||
+          (await this.getCurrentReceiverId(transactionId, tx)),
+        amount: transactionData.amount ?? null,
+        currency: transactionData.currency ?? null,
         destinationAmount: transactionData.destinationAmount || null,
         destinationCurrency: transactionData.destinationCurrency || null,
+        timestamp: transactionData.timestamp ?? null,
         description: transactionData.description || null,
-        senderId: transactionData.senderId,
-        receiverId: transactionData.receiverId,
+        deviceId: transactionData.deviceId || null,
       }
     );
 
@@ -213,7 +299,7 @@ class TransactionModel {
     // Delete existing shared relationships
     await tx.run(
       `
-      MATCH (t:Transaction {id: $transactionId})-[r:SHARED_IP|SHARED_DEVICE]->()
+      MATCH (t:Transaction {id: $transactionId})-[r:SHARED_IP|SHARED_DEVICE]-()
       DELETE r
       `,
       { transactionId }
@@ -225,7 +311,52 @@ class TransactionModel {
     // Create shared relationships based on common attributes
     await this.createSharedRelationships(transactionId, transactionData, tx);
 
+    const deviceInfo = await this.getTransactionDeviceInfo(transactionId, tx);
+    if (deviceInfo) {
+      updatedTransaction.deviceInfo = deviceInfo;
+    }
+
     return updatedTransaction;
+  }
+
+  /**
+   * Helper method to get the current senderId of a transaction
+   */
+  private async getCurrentSenderId(
+    transactionId: string,
+    tx: any
+  ): Promise<string> {
+    const result = await tx.run(
+      `
+      MATCH (t:Transaction {id: $transactionId})
+      RETURN t.senderId AS senderId
+      `,
+      { transactionId }
+    );
+    if (result.records.length === 0) {
+      throw new AppError(`Transaction with ID ${transactionId} not found`, 404);
+    }
+    return result.records[0].get('senderId');
+  }
+
+  /**
+   * Helper method to get the current receiverId of a transaction
+   */
+  private async getCurrentReceiverId(
+    transactionId: string,
+    tx: any
+  ): Promise<string> {
+    const result = await tx.run(
+      `
+      MATCH (t:Transaction {id: $transactionId})
+      RETURN t.receiverId AS receiverId
+      `,
+      { transactionId }
+    );
+    if (result.records.length === 0) {
+      throw new AppError(`Transaction with ID ${transactionId} not found`, 404);
+    }
+    return result.records[0].get('receiverId');
   }
 
   /**
@@ -292,8 +423,8 @@ class TransactionModel {
    * Creates shared relationships between transactions with common attributes
    *
    * This helper method establishes relationships between transactions that share:
-   * - IP addresses
-   * - Device IDs
+   * - IP addresses (bidirectional)
+   * - Device IDs (bidirectional)
    *
    * @param transactionId ID of the transaction to create relationships for
    * @param transactionData Transaction data containing attributes to check for sharing
@@ -304,27 +435,27 @@ class TransactionModel {
     transactionData: Partial<ITransaction>,
     tx: any
   ): Promise<void> {
-    // Shared IP Address
+    // Shared IP Address (bidirectional)
     if (transactionData.deviceInfo?.ipAddress) {
       await tx.run(
         `
         MATCH (t1:Transaction {id: $transactionId})-[:FROM_DEVICE]->(d1:DeviceInfo)
         MATCH (t2:Transaction)-[:FROM_DEVICE]->(d2:DeviceInfo)
         WHERE d2.ipAddress = $ipAddress AND t2.id <> $transactionId
-        CREATE (t1)-[:SHARED_IP]->(t2)
+        MERGE (t1)-[:SHARED_IP]-(t2)
         `,
         { transactionId, ipAddress: transactionData.deviceInfo.ipAddress }
       );
     }
 
-    // Shared Device ID
+    // Shared Device ID (bidirectional)
     if (transactionData.deviceId) {
       await tx.run(
         `
         MATCH (t1:Transaction {id: $transactionId})
         MATCH (t2:Transaction)
         WHERE t2.deviceId = $deviceId AND t2.id <> $transactionId
-        CREATE (t1)-[:SHARED_DEVICE]->(t2)
+        MERGE (t1)-[:SHARED_DEVICE]-(t2)
         `,
         { transactionId, deviceId: transactionData.deviceId }
       );
@@ -332,7 +463,7 @@ class TransactionModel {
   }
 
   /**
-   * Helper method to extract a basic transaction from a Neo4j record
+   * Helper method to extract a basic transaction from a Neo4j record and fetch related device info
    */
   private extractTransactionFromRecord(result: any): ITransaction {
     const record = result.records[0];
@@ -382,7 +513,9 @@ class TransactionModel {
         `
         MATCH (t:Transaction)
         OPTIONAL MATCH (t)-[:USED_PAYMENT]->(p:PaymentType)
-        RETURN t, p
+        OPTIONAL MATCH (t)-[:FROM_DEVICE]->(d:DeviceInfo)
+        OPTIONAL MATCH (d)-[:LOCATED_AT]->(g:Geolocation)
+        RETURN t, p, d, g
         ORDER BY t.timestamp DESC
         SKIP $offset
         LIMIT $limit
@@ -401,6 +534,24 @@ class TransactionModel {
       const transactions = result.records.map((record) => {
         const t = record.get('t').properties;
         const p = record.get('p')?.properties;
+        const d = record.get('d')?.properties;
+        const g = record.get('g')?.properties;
+
+        // Build device info object if available
+        let deviceInfo: any = undefined;
+        if (d) {
+          deviceInfo = {
+            ipAddress: d.ipAddress,
+          };
+
+          if (g) {
+            deviceInfo.geolocation = {
+              country: g.country,
+              state: g.state,
+            };
+          }
+        }
+
         return {
           ...t,
           amount:
@@ -412,6 +563,7 @@ class TransactionModel {
               ? t.destinationAmount.toNumber()
               : t.destinationAmount,
           paymentMethod: p ? p.type : undefined,
+          deviceInfo: deviceInfo,
         };
       });
       return {
@@ -704,17 +856,40 @@ class TransactionModel {
         SKIP $offset
         LIMIT $limit
         OPTIONAL MATCH (t)-[:USED_PAYMENT]->(pt_node:PaymentType)
-        RETURN t, COLLECT(DISTINCT pt_node) AS paymentMethods
+        OPTIONAL MATCH (t)-[:FROM_DEVICE]->(d:DeviceInfo)
+        OPTIONAL MATCH (d)-[:LOCATED_AT]->(g:Geolocation)
+        RETURN t, COLLECT(DISTINCT pt_node) AS paymentMethods, d, g
       `;
       const result = await session.run(searchQuery, searchParams);
-
       const transactions = result.records.map((record) => {
         const transactionNode = record.get('t');
         const paymentMethods = record.get('paymentMethods') || [];
-        return this.formatTransactionFromRecord({
+        const deviceInfoNode = record.get('d');
+        const geolocationNode = record.get('g');
+
+        // Format the transaction
+        const transaction = this.formatTransactionFromRecord({
           transaction: transactionNode,
           paymentMethods,
         });
+
+        // Add device info if available
+        if (deviceInfoNode) {
+          const deviceInfo: any = {
+            ipAddress: deviceInfoNode.properties.ipAddress,
+          };
+
+          if (geolocationNode) {
+            deviceInfo.geolocation = {
+              country: geolocationNode.properties.country,
+              state: geolocationNode.properties.state,
+            };
+          }
+
+          transaction.deviceInfo = deviceInfo;
+        }
+
+        return transaction;
       });
 
       const totalPages =
@@ -739,6 +914,61 @@ class TransactionModel {
       );
     } finally {
       await session.close();
+    }
+  }
+
+  /**
+   * Retrieves device info and geolocation for a transaction
+   *
+   * @param transactionId ID of the transaction
+   * @param tx Active Neo4j transaction (optional)
+   * @returns Device info object or undefined
+   */
+  private async getTransactionDeviceInfo(
+    transactionId: string,
+    tx?: any
+  ): Promise<ITransaction['deviceInfo'] | undefined> {
+    const session = tx || Neo4jService.getSession();
+    const ownSession = !tx;
+
+    try {
+      const result = await session.run(
+        `
+        MATCH (t:Transaction {id: $transactionId})-[:FROM_DEVICE]->(d:DeviceInfo)
+        OPTIONAL MATCH (d)-[:LOCATED_AT]->(g:Geolocation)
+        RETURN d, g
+        `,
+        { transactionId }
+      );
+
+      if (result.records.length === 0) {
+        return undefined;
+      }
+
+      const record = result.records[0];
+      const deviceInfo = record.get('d')?.properties;
+      const geolocation = record.get('g')?.properties;
+
+      if (!deviceInfo) {
+        return undefined;
+      }
+
+      const deviceInfoObj: ITransaction['deviceInfo'] = {
+        ipAddress: deviceInfo.ipAddress,
+      };
+
+      if (geolocation) {
+        deviceInfoObj.geolocation = {
+          country: geolocation.country,
+          state: geolocation.state,
+        };
+      }
+
+      return deviceInfoObj;
+    } finally {
+      if (ownSession) {
+        await session.close();
+      }
     }
   }
 }
