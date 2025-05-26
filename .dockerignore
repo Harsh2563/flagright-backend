@@ -1,0 +1,33 @@
+# Dependencies
+node_modules
+npm-debug.log
+
+# Build output
+dist
+
+# Version control
+.git
+.gitignore
+
+# Environment files
+.env
+.env.*
+
+# Development files
+*.md
+.eslintrc
+.prettier*
+nodemon.json
+
+# IDE files
+.vscode
+.idea
+
+# Logs
+logs
+*.log
+
+# Test files
+__tests__
+*.test.*
+*.spec.*

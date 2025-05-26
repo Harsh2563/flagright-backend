@@ -223,16 +223,16 @@ class UserModel {
     if (userData.address) {
       await tx.run(
         `
-        MATCH (u:User {id: $userId})
-        CREATE (a:Address {
-          street: $street,
-          city: $city,
-          state: $state,
-          postalCode: $postalCode,
-          country: $country
-        })
-        CREATE (u)-[:HAS_ADDRESS]->(a)
-        `,
+      MATCH (u:User {id: $userId})
+      CREATE (a:Address {
+        street: $street,
+        city: $city,
+        state: $state,
+        postalCode: $postalCode,
+        country: $country
+      })
+      CREATE (u)-[:HAS_ADDRESS]->(a)
+      `,
         {
           userId,
           street: userData.address?.street || null,
@@ -249,13 +249,13 @@ class UserModel {
       for (const paymentMethod of userData.paymentMethods) {
         await tx.run(
           `
-          MATCH (u:User {id: $userId})
-          CREATE (p:PaymentMethod {
-            id: $paymentId,
-            type: $paymentType
-          Buehler
-          CREATE (u)-[:HAS_PAYMENT_METHOD]->(p)
-          `,
+        MATCH (u:User {id: $userId})
+        CREATE (p:PaymentMethod {
+          id: $paymentId,
+          type: $paymentType
+        })
+        CREATE (u)-[:HAS_PAYMENT_METHOD]->(p)
+        `,
           {
             userId,
             paymentId: paymentMethod.id,
@@ -438,7 +438,7 @@ class UserModel {
         { offset: neo4j.int(offset), limit: neo4j.int(limit) }
       );
 
-      const users = result.records.map((record:any) =>
+      const users = result.records.map((record: any) =>
         this.formatUserFromRecord({
           user: record.get('u'),
           address: record.get('a'),
@@ -843,7 +843,7 @@ class UserModel {
       `;
       const result = await session.run(searchQuery, searchParams);
 
-      const users = result.records.map((record:any) =>
+      const users = result.records.map((record: any) =>
         this.formatUserFromRecord({
           user: record.get('u'),
           address: record.get('address'),
