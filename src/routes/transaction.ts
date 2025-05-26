@@ -1,9 +1,11 @@
 import { RequestHandler, Router } from 'express';
 import { validateRequest } from '../middleware/validateRequest';
-import { TransactionSchema } from '../validators/transaction';
+import {
+  TransactionSchema,
+  TransactionSearchSchema,
+} from '../validators/transaction';
 import TransactionController from '../controllers/transaction';
 import { validateSearchQuery } from '../middleware/validateSearchQuery';
-import { TransactionSearchSchema } from '../validators/transactionSearch';
 
 const router = Router();
 

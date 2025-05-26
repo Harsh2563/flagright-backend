@@ -1,7 +1,7 @@
 import { NextFunction, Request, Response } from 'express';
 import UserModel from '../models/User';
 import { AppError } from '../utils/appError';
-import { IUserSearchQuery } from '../interfaces/userSearch';
+import { IUserSearchQuery } from '../interfaces/user';
 
 export default class UserController {
   public static async handleUser(
@@ -44,7 +44,7 @@ export default class UserController {
       const page = Math.max(Number(req.query.page) || 1, 1);
       const limit = Math.max(Number(req.query.limit) || 30, 1);
       const offset = (page - 1) * limit;
-      const {users, pagination} = await UserModel.getAllUsers(offset, limit);
+      const { users, pagination } = await UserModel.getAllUsers(offset, limit);
 
       return res.status(200).json({
         status: 'success',
@@ -96,13 +96,17 @@ export default class UserController {
   }
 
   public static async getShortestPath(
-    req: Request, 
+    req: Request,
     res: Response,
-    next: NextFunction) {
+    next: NextFunction
+  ) {
     try {
       const { startUserId, targetUserId } = req.body;
 
-      const path = await UserModel.findShortestPathBetweenUsers(startUserId, targetUserId);
+      const path = await UserModel.findShortestPathBetweenUsers(
+        startUserId,
+        targetUserId
+      );
 
       return res.status(200).json({
         status: 'success',
@@ -118,5 +122,5 @@ export default class UserController {
       console.error('Error in getShortestPath:', error);
       next(error);
     }
-}
+  }
 }

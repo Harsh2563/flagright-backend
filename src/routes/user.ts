@@ -2,7 +2,7 @@ import { RequestHandler, Router } from 'express';
 import { validateRequest } from '../middleware/validateRequest';
 import { validateSearchQuery } from '../middleware/validateSearchQuery';
 import { ShortestPath, UserSchema } from '../validators/user';
-import { UserSearchSchema } from '../validators/userSearch';
+import { UserSearchSchema } from '../validators/user';
 import UserController from '../controllers/user';
 
 const router = Router();
@@ -21,5 +21,9 @@ router.get(
   UserController.searchUsers as RequestHandler
 );
 
-router.post('/shortest-path', validateRequest(ShortestPath) ,UserController.getShortestPath as RequestHandler);
+router.post(
+  '/shortest-path',
+  validateRequest(ShortestPath),
+  UserController.getShortestPath as RequestHandler
+);
 export default router;
