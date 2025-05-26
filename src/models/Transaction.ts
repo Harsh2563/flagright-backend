@@ -1,14 +1,154 @@
 import neo4j from 'neo4j-driver';
 import Neo4jService from '../services/neo4j.service';
-import { ITransaction } from '../interfaces/transaction';
-import { AppError } from '../utils/appError';
-import { ITransactionConnections } from '../interfaces/relationship';
 import {
+  ITransaction,
   ITransactionSearchQuery,
   ITransactionSearchResult,
-} from '../interfaces/transactionSearch';
+} from '../interfaces/transaction';
+import { AppError } from '../utils/appError';
+import { ITransactionConnections } from '../interfaces/relationship';
 
 class TransactionModel {
+  /**
+   * Executes a database operation within a Neo4j session and handles common error patterns
+   * @param operation Function that performs the database operation
+   * @returns Result of the operation
+   * @throws AppError if the operation fails
+   */
+  private async executeDbOperation<T>(
+    operation: (session: any) => Promise<T>,
+    errorMessage: string = 'Database operation failed'
+  ): Promise<T> {
+    const session = Neo4jService.getSession();
+    try {
+      return await operation(session);
+    } catch (error) {
+      if (error instanceof AppError) {
+        throw error;
+      }
+      throw new AppError(
+        `${errorMessage}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        error instanceof AppError ? error.statusCode : 500
+      );
+    } finally {
+      await session.close();
+    }
+  }
+
+  /**
+   * Performs a database operation within a transaction and handles errors
+   * @param operation Function that performs the transaction operations
+   * @returns Result of the operation
+   * @throws AppError if the operation fails
+   */
+  private async executeInTransaction<T>(
+    operation: (tx: any) => Promise<T>,
+    errorMessage: string = 'Transaction operation failed'
+  ): Promise<T> {
+    return this.executeDbOperation(async (session) => {
+      const tx = session.beginTransaction();
+      try {
+        const result = await operation(tx);
+        await tx.commit();
+        return result;
+      } catch (error) {
+        await tx.rollback();
+        throw error;
+      }
+    }, errorMessage);
+  }
+
+  /**
+   * Extracts a transaction object from Neo4j record
+   */
+  private extractTransactionFromRecord(result: any): ITransaction {
+    const record = result.records[0];
+    const txProps = record.get('t').properties;
+    // Get sender and receiver IDs from the transaction properties
+    const senderId = txProps.senderId;
+    const receiverId = txProps.receiverId;
+
+    return {
+      id: txProps.id,
+      transactionType: txProps.transactionType,
+      status: txProps.status,
+      senderId,
+      receiverId,
+      amount: neo4j.isInt(txProps.amount)
+        ? txProps.amount.toNumber()
+        : txProps.amount,
+      currency: txProps.currency,
+      destinationAmount: txProps.destinationAmount
+        ? neo4j.isInt(txProps.destinationAmount)
+          ? txProps.destinationAmount.toNumber()
+          : txProps.destinationAmount
+        : undefined,
+      destinationCurrency: txProps.destinationCurrency || undefined,
+      timestamp: txProps.timestamp,
+      description: txProps.description || undefined,
+      deviceId: txProps.deviceId || undefined,
+    };
+  }
+
+  /**
+   * Validates sender and receiver existence and relationship
+   */
+  private async validateSenderAndReceiver(
+    senderId: string | undefined,
+    receiverId: string | undefined,
+    tx: any
+  ): Promise<void> {
+    if (senderId) {
+      const senderResult = await tx.run('MATCH (u:User {id: $id}) RETURN u', {
+        id: senderId,
+      });
+      if (senderResult.records.length === 0) {
+        throw new AppError(`Sender with ID ${senderId} not found`, 404);
+      }
+    }
+
+    if (receiverId) {
+      const receiverResult = await tx.run('MATCH (u:User {id: $id}) RETURN u', {
+        id: receiverId,
+      });
+      if (receiverResult.records.length === 0) {
+        throw new AppError(`Receiver with ID ${receiverId} not found`, 404);
+      }
+    }
+
+    // Check if sender and receiver are the same, if both are provided
+    if (senderId && receiverId && senderId === receiverId) {
+      throw new AppError(`Sender and receiver cannot be the same user`, 400);
+    }
+  }
+
+  /**
+   * Formats device info and geolocation from Neo4j record
+   */
+  private formatDeviceInfo(
+    deviceInfoNode: any,
+    geolocationNode: any
+  ): ITransaction['deviceInfo'] | undefined {
+    if (!deviceInfoNode) {
+      return undefined;
+    }
+
+    const deviceInfo: any = {
+      ipAddress: deviceInfoNode.properties.ipAddress,
+    };
+
+    if (geolocationNode) {
+      deviceInfo.geolocation = {
+        country: geolocationNode.properties.country,
+        state: geolocationNode.properties.state,
+      };
+    }
+
+    return deviceInfo;
+  }
+
   /**
    * Upserts a transaction (updates if ID is provided, otherwise creates new)
    *
@@ -27,141 +167,95 @@ class TransactionModel {
   async upsert(
     transactionData: Partial<ITransaction>
   ): Promise<{ transaction: ITransaction; isNew: boolean }> {
-    const session = Neo4jService.getSession();
-
-    try {
-      // Start a transaction
-      const tx = session.beginTransaction();
-      try {
-        // Handle updates by ID only
-        if (transactionData.id) {
-          const existingResult = await tx.run(
-            `
-            MATCH (t:Transaction {id: $id})
-            RETURN t
-            `,
-            { id: transactionData.id }
-          );
-
-          if (existingResult.records.length > 0) {
-            // Transaction with provided ID exists - update it
-            const updatedTransaction = await this.updateExistingTransaction(
-              transactionData.id,
-              transactionData,
-              tx
-            );
-            await tx.commit();
-            return { transaction: updatedTransaction, isNew: false };
-          } else {
-            throw new AppError(
-              `Transaction with ID ${transactionData.id} not found`,
-              404
-            );
-          }
-        }
-
-        // Verify that both sender and receiver exist
-        const senderResult = await tx.run('MATCH (u:User {id: $id}) RETURN u', {
-          id: transactionData.senderId,
-        });
-
-        const receiverResult = await tx.run(
-          'MATCH (u:User {id: $id}) RETURN u',
-          { id: transactionData.receiverId }
-        );
-
-        if (senderResult.records.length === 0) {
-          throw new AppError(
-            `Sender with ID ${transactionData.senderId} not found`,
-            404
-          );
-        }
-
-        if (receiverResult.records.length === 0) {
-          throw new AppError(
-            `Receiver with ID ${transactionData.receiverId} not found`,
-            404
-          );
-        }
-
-        // Check if sender and receiver are the same
-        if (transactionData.senderId === transactionData.receiverId) {
-          throw new AppError(
-            `Sender and receiver cannot be the same user`,
-            400
-          );
-        }
-
-        // Create the transaction
-        const result = await tx.run(
+    return this.executeInTransaction(async (tx) => {
+      // Handle updates by ID only
+      if (transactionData.id) {
+        const existingResult = await tx.run(
           `
-          MATCH (sender:User {id: $senderId})
-          MATCH (receiver:User {id: $receiverId})
-          CREATE (t:Transaction {
-            id: randomUUID(),
-            transactionType: $transactionType,
-            status: $status,
-            senderId: $senderId,
-            receiverId: $receiverId,
-            amount: $amount,
-            currency: $currency,
-            destinationAmount: $destinationAmount,
-            destinationCurrency: $destinationCurrency,
-            timestamp: $timestamp,
-            description: $description,
-            deviceId: $deviceId
-          })
-          CREATE (sender)-[:SENT]->(t)
-          CREATE (t)-[:RECEIVED_BY]->(receiver)
-          RETURN t, sender, receiver
+          MATCH (t:Transaction {id: $id})
+          RETURN t
           `,
-          {
-            senderId: transactionData.senderId,
-            receiverId: transactionData.receiverId,
-            transactionType: transactionData.transactionType,
-            status: transactionData.status,
-            amount: transactionData.amount,
-            currency: transactionData.currency,
-            destinationAmount: transactionData.destinationAmount || null,
-            destinationCurrency: transactionData.destinationCurrency || null,
-            timestamp: transactionData.timestamp,
-            description: transactionData.description || null,
-            deviceId: transactionData.deviceId || null,
-          }
+          { id: transactionData.id }
         );
 
-        const transaction = this.extractTransactionFromRecord(result);
-
-        // Create related entities and establish relationships
-        await this.createRelatedEntities(transaction.id, transactionData, tx);
-
-        // Create shared relationships based on common attributes
-        await this.createSharedRelationships(
-          transaction.id,
-          transactionData,
-          tx
-        );
-
-        const deviceInfo = await this.getTransactionDeviceInfo(
-          transaction.id,
-          tx
-        );
-        if (deviceInfo) {
-          transaction.deviceInfo = deviceInfo;
+        if (existingResult.records.length > 0) {
+          // Transaction with provided ID exists - update it
+          const updatedTransaction = await this.updateExistingTransaction(
+            transactionData.id,
+            transactionData,
+            tx
+          );
+          return { transaction: updatedTransaction, isNew: false };
+        } else {
+          throw new AppError(
+            `Transaction with ID ${transactionData.id} not found`,
+            404
+          );
         }
-
-        await tx.commit();
-        return { transaction, isNew: true };
-      } catch (error) {
-        await tx.rollback();
-        throw new AppError(
-          'Error while upserting transaction: ' +
-            (error instanceof Error ? error.message : String(error))
-        );
       }
-    } finally {
-      await session.close();
-    }
+
+      // Validate sender and receiver for new transactions
+      await this.validateSenderAndReceiver(
+        transactionData.senderId,
+        transactionData.receiverId,
+        tx
+      );
+
+      // Create the transaction
+      const result = await tx.run(
+        `
+        MATCH (sender:User {id: $senderId})
+        MATCH (receiver:User {id: $receiverId})
+        CREATE (t:Transaction {
+          id: randomUUID(),
+          transactionType: $transactionType,
+          status: $status,
+          senderId: $senderId,
+          receiverId: $receiverId,
+          amount: $amount,
+          currency: $currency,
+          destinationAmount: $destinationAmount,
+          destinationCurrency: $destinationCurrency,
+          timestamp: $timestamp,
+          description: $description,
+          deviceId: $deviceId        })
+        CREATE (sender)-[:SENT {weight: 1.0}]->(t)
+        CREATE (t)-[:RECEIVED_BY {weight: 1.0}]->(receiver)
+        RETURN t, sender, receiver
+        `,
+        {
+          senderId: transactionData.senderId,
+          receiverId: transactionData.receiverId,
+          transactionType: transactionData.transactionType,
+          status: transactionData.status,
+          amount: transactionData.amount,
+          currency: transactionData.currency,
+          destinationAmount: transactionData.destinationAmount || null,
+          destinationCurrency: transactionData.destinationCurrency || null,
+          timestamp: transactionData.timestamp,
+          description: transactionData.description || null,
+          deviceId: transactionData.deviceId || null,
+        }
+      );
+
+      const transaction = this.extractTransactionFromRecord(result);
+
+      // Create related entities and establish relationships
+      await this.createRelatedEntities(transaction.id, transactionData, tx);
+
+      // Create shared relationships based on common attributes
+      await this.createSharedRelationships(transaction.id, transactionData, tx);
+
+      const deviceInfo = await this.getTransactionDeviceInfo(
+        transaction.id,
+        tx
+      );
+      if (deviceInfo) {
+        transaction.deviceInfo = deviceInfo;
+      }
+
+      return { transaction, isNew: true };
+    }, 'Error while upserting transaction');
   }
 
   /**
@@ -177,39 +271,14 @@ class TransactionModel {
     transactionData: Partial<ITransaction>,
     tx: any
   ): Promise<ITransaction> {
-    if (transactionData.senderId) {
-      const senderResult = await tx.run('MATCH (u:User {id: $id}) RETURN u', {
-        id: transactionData.senderId,
-      });
-      if (senderResult.records.length === 0) {
-        throw new AppError(
-          `Sender with ID ${transactionData.senderId} not found`,
-          404
-        );
-      }
-    }
+    // Validate sender and receiver
+    await this.validateSenderAndReceiver(
+      transactionData.senderId,
+      transactionData.receiverId,
+      tx
+    );
 
-    if (transactionData.receiverId) {
-      const receiverResult = await tx.run('MATCH (u:User {id: $id}) RETURN u', {
-        id: transactionData.receiverId,
-      });
-      if (receiverResult.records.length === 0) {
-        throw new AppError(
-          `Receiver with ID ${transactionData.receiverId} not found`,
-          404
-        );
-      }
-    }
-
-    // Check if sender and receiver are the same, if both are provided
-    if (
-      transactionData.senderId &&
-      transactionData.receiverId &&
-      transactionData.senderId === transactionData.receiverId
-    ) {
-      throw new AppError(`Sender and receiver cannot be the same user`, 400);
-    }
-
+    // Update user relationships if needed
     if (transactionData.senderId || transactionData.receiverId) {
       await tx.run(
         `
@@ -221,12 +290,11 @@ class TransactionModel {
 
       // Create new relationships
       await tx.run(
-        `
-        MATCH (t:Transaction {id: $transactionId})
+        `        MATCH (t:Transaction {id: $transactionId})
         MATCH (sender:User {id: $senderId})
         MATCH (receiver:User {id: $receiverId})
-        CREATE (sender)-[:SENT]->(t)
-        CREATE (t)-[:RECEIVED_BY]->(receiver)
+        CREATE (sender)-[:SENT {weight: 1.0}]->(t)
+        CREATE (t)-[:RECEIVED_BY {weight: 1.0}]->(receiver)
         `,
         {
           transactionId,
@@ -463,38 +531,6 @@ class TransactionModel {
   }
 
   /**
-   * Helper method to extract a basic transaction from a Neo4j record and fetch related device info
-   */
-  private extractTransactionFromRecord(result: any): ITransaction {
-    const record = result.records[0];
-    const txProps = record.get('t').properties;
-    // Get sender and receiver IDs from the transaction properties
-    const senderId = txProps.senderId;
-    const receiverId = txProps.receiverId;
-
-    return {
-      id: txProps.id,
-      transactionType: txProps.transactionType,
-      status: txProps.status,
-      senderId,
-      receiverId,
-      amount: neo4j.isInt(txProps.amount)
-        ? txProps.amount.toNumber()
-        : txProps.amount,
-      currency: txProps.currency,
-      destinationAmount: txProps.destinationAmount
-        ? neo4j.isInt(txProps.destinationAmount)
-          ? txProps.destinationAmount.toNumber()
-          : txProps.destinationAmount
-        : undefined,
-      destinationCurrency: txProps.destinationCurrency || undefined,
-      timestamp: txProps.timestamp,
-      description: txProps.description || undefined,
-      deviceId: txProps.deviceId || undefined,
-    };
-  }
-
-  /**
    * Retrieves all transactions from the database with their associated data
    *
    * This method will:
@@ -507,8 +543,7 @@ class TransactionModel {
     offset = 0,
     limit = 10
   ): Promise<{ transactions: ITransaction[]; pagination: any }> {
-    const session = Neo4jService.getSession();
-    try {
+    return this.executeDbOperation(async (session) => {
       const result = await session.run(
         `
         MATCH (t:Transaction)
@@ -522,35 +557,28 @@ class TransactionModel {
       `,
         { offset: neo4j.int(offset), limit: neo4j.int(limit) }
       );
+
       const countResult = await session.run(
         'MATCH (t:Transaction) RETURN COUNT(t) AS total'
       );
+
       const totalValue = countResult.records[0].get('total');
       const totalTransactions =
         typeof totalValue === 'object' && totalValue.toNumber
           ? totalValue.toNumber()
           : totalValue;
       const totalPages = Math.ceil(totalTransactions / limit);
-      const transactions = result.records.map((record) => {
+      const transactions = result.records.map((record: any) => {
         const t = record.get('t').properties;
         const p = record.get('p')?.properties;
         const d = record.get('d')?.properties;
         const g = record.get('g')?.properties;
 
         // Build device info object if available
-        let deviceInfo: any = undefined;
-        if (d) {
-          deviceInfo = {
-            ipAddress: d.ipAddress,
-          };
-
-          if (g) {
-            deviceInfo.geolocation = {
-              country: g.country,
-              state: g.state,
-            };
-          }
-        }
+        const deviceInfo = this.formatDeviceInfo(
+          d ? { properties: d } : null,
+          g ? { properties: g } : null
+        );
 
         return {
           ...t,
@@ -566,6 +594,7 @@ class TransactionModel {
           deviceInfo: deviceInfo,
         };
       });
+
       return {
         transactions,
         pagination: {
@@ -576,9 +605,7 @@ class TransactionModel {
           hasPreviousPage: offset / limit + 1 > 1,
         },
       };
-    } finally {
-      session.close();
-    }
+    });
   }
 
   /**
@@ -595,8 +622,7 @@ class TransactionModel {
   async getTransactionConnections(
     transactionId: string
   ): Promise<ITransactionConnections> {
-    const session = Neo4jService.getSession();
-    try {
+    return this.executeDbOperation(async (session) => {
       // Fetch sender and receiver information
       const usersResult = await session.run(
         `
@@ -628,9 +654,8 @@ class TransactionModel {
         `,
         { transactionId }
       );
-
       const sharedDeviceTransactions = sharedDeviceResult.records.map(
-        (record) => ({
+        (record: any) => ({
           relationshipType: record.get('relationshipType'),
           transaction: record.get('relatedTransaction'),
         })
@@ -646,11 +671,12 @@ class TransactionModel {
         `,
         { transactionId }
       );
-
-      const sharedIPTransactions = sharedIPResult.records.map((record) => ({
-        relationshipType: record.get('relationshipType'),
-        transaction: record.get('relatedTransaction'),
-      }));
+      const sharedIPTransactions = sharedIPResult.records.map(
+        (record: any) => ({
+          relationshipType: record.get('relationshipType'),
+          transaction: record.get('relatedTransaction'),
+        })
+      );
 
       // Return combined results
       return {
@@ -659,19 +685,7 @@ class TransactionModel {
         sharedDeviceTransactions,
         sharedIPTransactions,
       };
-    } catch (error) {
-      if (error instanceof AppError) {
-        throw error;
-      }
-      console.error('Error in getTransactionConnections:', error);
-      throw new AppError(
-        'Error while fetching transaction connections: ' +
-          (error instanceof Error ? error.message : String(error)),
-        500
-      );
-    } finally {
-      session.close();
-    }
+    }, 'Error while fetching transaction connections');
   }
 
   /**
@@ -761,41 +775,6 @@ class TransactionModel {
   }
 
   /**
-   * Formats a transaction record from Neo4j into the ITransaction interface
-   */
-  private formatTransactionFromRecord(record: {
-    transaction: any;
-    paymentMethods: any[];
-  }): ITransaction {
-    const { transaction, paymentMethods } = record;
-    const props = transaction.properties;
-    return {
-      id: props.id,
-      transactionType: props.transactionType,
-      status: props.status,
-      senderId: props.senderId,
-      receiverId: props.receiverId,
-      amount: neo4j.isInt(props.amount)
-        ? props.amount.toNumber()
-        : props.amount,
-      currency: props.currency,
-      destinationAmount: props.destinationAmount
-        ? neo4j.isInt(props.destinationAmount)
-          ? props.destinationAmount.toNumber()
-          : props.destinationAmount
-        : undefined,
-      destinationCurrency: props.destinationCurrency || undefined,
-      timestamp: props.timestamp,
-      description: props.description || undefined,
-      deviceId: props.deviceId || undefined,
-      paymentMethod:
-        paymentMethods.length > 0
-          ? paymentMethods[0].properties.type
-          : undefined,
-    };
-  }
-
-  /**
    * Searches for transactions based on various criteria
    *
    * This method supports filtering by transaction attributes, pagination, and sorting.
@@ -806,8 +785,7 @@ class TransactionModel {
   async searchTransactions(
     query: ITransactionSearchQuery
   ): Promise<ITransactionSearchResult> {
-    const session = Neo4jService.getSession();
-    try {
+    return this.executeDbOperation(async (session) => {
       const { searchText, page, limit, sortBy, sortOrder, filters } = query;
       const offset = (page - 1) * limit;
 
@@ -861,7 +839,8 @@ class TransactionModel {
         RETURN t, COLLECT(DISTINCT pt_node) AS paymentMethods, d, g
       `;
       const result = await session.run(searchQuery, searchParams);
-      const transactions = result.records.map((record) => {
+
+      const transactions = result.records.map((record: any) => {
         const transactionNode = record.get('t');
         const paymentMethods = record.get('paymentMethods') || [];
         const deviceInfoNode = record.get('d');
@@ -874,20 +853,10 @@ class TransactionModel {
         });
 
         // Add device info if available
-        if (deviceInfoNode) {
-          const deviceInfo: any = {
-            ipAddress: deviceInfoNode.properties.ipAddress,
-          };
-
-          if (geolocationNode) {
-            deviceInfo.geolocation = {
-              country: geolocationNode.properties.country,
-              state: geolocationNode.properties.state,
-            };
-          }
-
-          transaction.deviceInfo = deviceInfo;
-        }
+        transaction.deviceInfo = this.formatDeviceInfo(
+          deviceInfoNode,
+          geolocationNode
+        );
 
         return transaction;
       });
@@ -906,15 +875,42 @@ class TransactionModel {
           hasPreviousPage: currentPage > 1,
         },
       };
-    } catch (error) {
-      throw new AppError(
-        'Failed to search transactions: ' +
-          (error instanceof Error ? error.message : String(error)),
-        500
-      );
-    } finally {
-      await session.close();
-    }
+    }, 'Failed to search transactions');
+  }
+
+  /**
+   * Formats a transaction record from Neo4j into the ITransaction interface
+   */
+  private formatTransactionFromRecord(record: {
+    transaction: any;
+    paymentMethods: any[];
+  }): ITransaction {
+    const { transaction, paymentMethods } = record;
+    const props = transaction.properties;
+    return {
+      id: props.id,
+      transactionType: props.transactionType,
+      status: props.status,
+      senderId: props.senderId,
+      receiverId: props.receiverId,
+      amount: neo4j.isInt(props.amount)
+        ? props.amount.toNumber()
+        : props.amount,
+      currency: props.currency,
+      destinationAmount: props.destinationAmount
+        ? neo4j.isInt(props.destinationAmount)
+          ? props.destinationAmount.toNumber()
+          : props.destinationAmount
+        : undefined,
+      destinationCurrency: props.destinationCurrency || undefined,
+      timestamp: props.timestamp,
+      description: props.description || undefined,
+      deviceId: props.deviceId || undefined,
+      paymentMethod:
+        paymentMethods.length > 0
+          ? paymentMethods[0].properties.type
+          : undefined,
+    };
   }
 
   /**
@@ -946,25 +942,7 @@ class TransactionModel {
       }
 
       const record = result.records[0];
-      const deviceInfo = record.get('d')?.properties;
-      const geolocation = record.get('g')?.properties;
-
-      if (!deviceInfo) {
-        return undefined;
-      }
-
-      const deviceInfoObj: ITransaction['deviceInfo'] = {
-        ipAddress: deviceInfo.ipAddress,
-      };
-
-      if (geolocation) {
-        deviceInfoObj.geolocation = {
-          country: geolocation.country,
-          state: geolocation.state,
-        };
-      }
-
-      return deviceInfoObj;
+      return this.formatDeviceInfo(record.get('d'), record.get('g'));
     } finally {
       if (ownSession) {
         await session.close();
