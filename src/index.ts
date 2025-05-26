@@ -25,7 +25,10 @@ class App {
     this.app.use(express.urlencoded({ extended: true }));
     this.app.use(
       cors({
-        origin: process.env.CLIENT_ORIGIN || 'http://localhost:3000', 
+        origin: [
+          'http://localhost:3000', // local dev
+          'https://flagright-frontend.vercel.app', // deployed frontend
+        ],
         credentials: true,
       })
     );
