@@ -42,7 +42,7 @@ export default class UserController {
     try {
       // Pagination support
       const page = Math.max(Number(req.query.page) || 1, 1);
-      const limit = Math.max(Number(req.query.limit) || 10, 1);
+      const limit = Math.max(Number(req.query.limit) || 30, 1);
       const offset = (page - 1) * limit;
       const {users, pagination} = await UserModel.getAllUsers(offset, limit);
 
