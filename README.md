@@ -2,7 +2,10 @@
 
 A graph-based visualization system for detecting and analyzing relationships between users and transactions, built with Node.js, TypeScript, and Neo4j. This system identifies patterns and connections through shared attributes and transaction histories.
 
-- Backend Repository: [https://github.com/Harsh2563/flagright-backend](https://github.com/Harsh2563/flagright-backend)
+- Backend Repository Link: [https://github.com/Harsh2563/flagright-backend](https://github.com/Harsh2563/flagright-backend)
+- Frontend Repository Link: [https://github.com/Harsh2563/flagright-frontend](https://github.com/Harsh2563/flagright-frontend)
+- Frontend Deployed Link: [https://flagright-frontend.vercel.app](https://flagright-frontend.vercel.app)
+- Backend Deployed Link: [https://flagright-backend-tvkg.onrender.com](https://flagright-backend-tvkg.onrender.com)
 
 ---
 
@@ -10,7 +13,7 @@ A graph-based visualization system for detecting and analyzing relationships bet
 - [Features](#features)
 - [Technologies Used](#technologies-used)
 - [Relationship Types](#relationship-types)
-- [Prerequisites](#prerequisries)
+- [Prerequisites](#prerequisites)
 - [Quick Start](#quick-start)
 - [API Endpoints](#api-endpoints)
 - [Development](#development)
@@ -18,6 +21,7 @@ A graph-based visualization system for detecting and analyzing relationships bet
 - [Graph Visualization](#graph-visualization)
 - [Troubleshooting](#troubleshooting)
 - [Folder Structure](#folder-structure)
+- [Video Demonstration](#video-demonstration)
 
 ## Features
 
@@ -271,4 +275,12 @@ backend/
 ├── tsconfig.json    # TypeScript configuration
 └── package.json     # Project dependencies
 ```
+
+---
+
+## Video Demonstration
+
+
+
+https://github.com/user-attachments/assets/7cfda17a-11e2-4487-bf31-db7ec3ac921e
 
