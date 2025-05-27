@@ -25,8 +25,6 @@ RUN apt-get update && apt-get install -y netcat-openbsd && rm -rf /var/lib/apt/l
 
 # Copy package files
 COPY package*.json ./
-COPY wait-for-it.sh ./
-RUN chmod +x wait-for-it.sh
 
 # Install production dependencies only
 RUN npm ci --only=production
